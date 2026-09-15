@@ -1,0 +1,679 @@
+# Example win-bootstrap.ps1 config. Copy this file, customize it, and either:
+#   - name your copy "win-bootstrap.config.yaml" and place it next to
+#     win-bootstrap.ps1 (the default location the script looks for), or
+#   - pass its path via -ConfigPath, or
+#   - host it (e.g. in a private repo) and pass its raw URL via -ConfigUrl
+#     (set $env:BOOTSTRAP_CONFIG_TOKEN first if the host requires auth; if
+#     the URL goes through a corporate TLS-inspecting proxy, see
+#     -ConfigCaPath / -ConfigUrlInsecureSkipCertCheck in win-bootstrap.ps1's
+#     own help - `Get-Help .\win-bootstrap.ps1 -Full`).
+#
+# Every section below is optional - a step with no corresponding entry is
+# simply skipped, that's expected and not an error. You could just as well
+# have a config that only sets root_ca and nothing else.
+#
+# Sections that aren't already a single boolean/enum value also accept
+# "disabled: true" to switch them off without deleting their content,
+# handy while iterating. Default false everywhere (runs as normal):
+#   - firewall / recovery_partition (map sections) - disabled: true right
+#     inside the map.
+#   - root_ca / defender_exclusions / smb_shares / local_users / apps
+#     (list sections) - disabled: true on an individual entry skips just
+#     that one; to disable the whole list at once instead, wrap it as
+#     "<key>: { disabled: true, items: [...] }" in place of a bare list -
+#     both shapes are accepted.
+# windows_terminal/ssh_server already have the whole-section effect via
+# their own "enable: false", and root_ca entries individually via
+# "install: false".
+#
+# win-bootstrap.ps1 also takes -Only <tags>/-Skip <tags> on the command
+# line (e.g. -Only ssh, or -Skip apps) to run just one feature or
+# everything-but-one without touching this file at all - see
+# `Get-Help .\win-bootstrap.ps1 -Full` for the full tag list.
+#
+# Before deploying a config anywhere, check it for authoring mistakes with
+# -ValidateConfig (no elevation, no machine state touched - safe to run on
+# any machine, not just the eventual target):
+#   .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml -ValidateConfig
+#
+# Supported YAML subset only (see the header comment in win-bootstrap.ps1
+# for the exact parser rules): 2-space indentation, no tabs, no flow
+# mappings ({a: b}), no anchors/aliases, no multi-document files. Comments
+# start with #.
+#
+# secret_manager (optional): required only if any field below uses a
+# "_secret_id" source (cert_secret_id, private_key_secret_id,
+# password_secret_id) - a secret ID in Bitwarden Secrets Manager, fetched
+# at run time via the bws CLI (installed automatically on first use, and
+# added to the machine PATH). "bws" is the only supported value today.
+# Requires $env:BWS_ACCESS_TOKEN to be set before running. Using a
+# "_secret_id" field anywhere without this set is a config error, caught
+# by -ValidateConfig above.
+# secret_manager: bws
+
+# ----------------------------------------------------------------------------
+# computer_name
+# ----------------------------------------------------------------------------
+# Renames the computer (takes effect after reboot). Windows 10 1709+ has a
+# built-in mDNS responder, so this also becomes reachable as
+# "<computer_name>.local" with no extra configuration (network permitting).
+computer_name: my-computer
+
+# ----------------------------------------------------------------------------
+# disable_vbs
+# ----------------------------------------------------------------------------
+# Disables Virtualization-Based Security / Core Isolation. Mainly useful
+# when this machine is itself a VM (double-virtualization overhead) -
+# leave this out entirely on physical hardware where you want it on.
+disable_vbs: true
+
+# ----------------------------------------------------------------------------
+# remove_onedrive
+# ----------------------------------------------------------------------------
+# Stops OneDrive, runs its own uninstaller (OneDriveSetup.exe /uninstall)
+# for the current account, and removes the leftover user folder if it's
+# empty afterward. Also sets the machine-wide DisableFileSyncNGSC policy
+# so OneDrive isn't silently reprovisioned for a local_users account
+# created afterward. A no-op (for the uninstall half) if OneDrive's
+# uninstaller isn't found (assumed not installed).
+remove_onedrive: true
+
+# ----------------------------------------------------------------------------
+# remove_teams
+# ----------------------------------------------------------------------------
+# Removes Microsoft Teams, whichever form is present: "new" Teams'
+# AppX provisioned/per-user package, and/or classic Teams' "Teams
+# Machine-Wide Installer". A no-op if none of those are found (assumed
+# not installed).
+remove_teams: true
+
+# ----------------------------------------------------------------------------
+# remove_outlook
+# ----------------------------------------------------------------------------
+# Removes "new" Outlook for Windows (Microsoft.OutlookForWindows): the
+# AppX provisioned package and any per-user installed package. Does not
+# touch classic desktop Outlook (Office). A no-op if not found (assumed
+# not installed).
+remove_outlook: true
+
+# ----------------------------------------------------------------------------
+# uac_level
+# ----------------------------------------------------------------------------
+# Sets User Account Control to one of Windows' own defined levels. Not
+# configured = left untouched. Valid values:
+#   off            - fully disables UAC (EnableLUA=0); requires a reboot
+#   never_notify   - Control Panel slider: "Never notify"
+#   default        - Control Panel slider: "Notify only when apps try to
+#                    make changes" (Windows' own out-of-box default)
+#   always_notify  - Control Panel slider: "Always notify"
+uac_level: default
+
+# ----------------------------------------------------------------------------
+# install_powershell7
+# ----------------------------------------------------------------------------
+# Installs PowerShell 7 via the native MSI build (winget installer type
+# "wix", never the default MSIX/Store package - MSIX doesn't work as an
+# OpenSSH default shell, see ssh_server below). Omit this entirely and
+# it's still auto-installed if windows_terminal.default_profile or
+# ssh_server.default_shell: pwsh7 need it; set it to false to explicitly
+# forbid installing it, which conflicts (fails immediately, before any
+# other step runs) if either of those also wants pwsh7. If PowerShell 7
+# was already installed via MSIX by an earlier run, installing here is a
+# no-op (winget refuses to switch installer types on an already-installed
+# package) - uninstall it first (winget uninstall --id Microsoft.PowerShell
+# --source winget) and re-run this script to switch to the native build.
+install_powershell7: true
+
+# ----------------------------------------------------------------------------
+# disable_pwsh_execution_policy
+# ----------------------------------------------------------------------------
+# Allow running local PowerShell scripts (Set-ExecutionPolicy Unrestricted).
+disable_pwsh_execution_policy: true
+
+# ----------------------------------------------------------------------------
+# recovery_partition
+# ----------------------------------------------------------------------------
+# Deletes the Windows Recovery partition (destructive, asks for
+# confirmation unless the script is run with -Quiet) and optionally grows
+# the system drive into the space it frees up.
+#
+# disabled (optional, default false) skips this whole section without
+# losing delete/extend_system_drive below.
+recovery_partition:
+  delete: true
+  extend_system_drive: true
+  # disabled: true
+
+# ----------------------------------------------------------------------------
+# defender_exclusions
+# ----------------------------------------------------------------------------
+# Any number of paths to exclude from Windows Defender. If a path doesn't
+# exist: create: true creates it first, otherwise that entry is skipped
+# with a warning (no directory is created, no exclusion is added).
+#
+# disabled (optional, default false) skips just that one entry, keeping it
+# here for later - or wrap the whole list as { disabled: true, items: [...] }
+# to skip all of it at once (see the top-of-file note on disabled: true).
+defender_exclusions:
+  - path: C:\Devel
+    create: true
+    # disabled: true
+
+# ----------------------------------------------------------------------------
+# windows_terminal
+# ----------------------------------------------------------------------------
+# enable installs Windows Terminal via winget if it isn't already present
+# (Windows 11 already ships it inbox, so this is usually a no-op there) -
+# always machine-wide, no scope field, same reasoning as
+# install_powershell7. false/omitted only means "leave this step alone" -
+# it never uninstalls an existing copy, even Windows 11's inbox one.
+#
+# default_profile is optional: cmd | pwsh5 | pwsh7 - sets Windows
+# Terminal's default profile to that shell. Only takes effect once
+# Windows Terminal has actually run at least once (it needs to have
+# created its settings.json); pwsh7 also relies on install_powershell7
+# above having installed it.
+#
+# desktop_shortcut (optional, default false) adds a shortcut to the
+# shared all-users desktop that launches Windows Terminal - it's an
+# MSIX/Store package, so unlike classic installers it never drops its own
+# .lnk file anywhere; this uses the shell:AppsFolder approach instead,
+# which is the officially supported way to shortcut a UWP app. Taskbar
+# pinning is intentionally not offered - Windows 11 blocks the
+# script-based ways to do that, but pinning a desktop shortcut by hand
+# (right-click -> Pin to taskbar) still works fine.
+windows_terminal:
+  enable: true
+  default_profile: pwsh7
+  desktop_shortcut: true
+
+# ----------------------------------------------------------------------------
+# firewall
+# ----------------------------------------------------------------------------
+# Three independent, optional keys:
+#   profile - public | private only. Windows assigns the "Domain" category
+#             automatically on domain-joined machines and won't let a
+#             script force it, so it's not a valid value here.
+#   ping    - block | allow_lan | allow_all. block actively removes this
+#             script's own ping-allow firewall rule if present (Windows
+#             ships with ping disabled by default on every profile, so
+#             this just makes that explicit/idempotent); allow_lan opens
+#             ICMPv4 Echo Request for Private/Domain networks; allow_all
+#             opens it for any network including Public.
+#   smb     - same block | allow_lan | allow_all shape, for the SMB
+#             share(s) below.
+#
+# profile and ping don't depend on each other - e.g. profile: public +
+# ping: allow_lan is valid, the rule just has no effect while the live
+# category stays Public.
+#
+# disabled (optional, default false) skips all three above without losing
+# the values.
+firewall:
+  profile: private
+  ping: allow_lan
+  smb: allow_lan
+  # disabled: true
+
+# ----------------------------------------------------------------------------
+# smb_shares
+# ----------------------------------------------------------------------------
+# Same create semantics as defender_exclusions above: path exists -> share
+# it as-is; missing + create: true -> create the directory first, then
+# share it; missing + create false/absent -> warn and skip, nothing
+# created or shared. access is read | change | full, granted to "Everyone"
+# (same default as Windows Explorer's own "Share with -> Everyone" - in
+# practice still requires a valid login on a workgroup machine unless
+# anonymous access is separately enabled, which is off by default) - this
+# script sets both the SMB share permission and a matching NTFS ACE on
+# path, so the effective access actually matches regardless of whatever
+# that path happened to inherit. Requires a corresponding firewall.smb
+# entry above (block | allow_lan | allow_all) to actually be reachable
+# over the network.
+#
+# disabled (optional, default false) skips just that one share, keeping it
+# here for later - or wrap the whole list as { disabled: true, items: [...] }
+# to skip all shares at once (see the top-of-file note on disabled: true).
+smb_shares:
+  - name: Shared
+    path: C:\Shared
+    create: true
+    access: read
+    # disabled: true
+
+# ----------------------------------------------------------------------------
+# local_users
+# ----------------------------------------------------------------------------
+# Create local Windows accounts. Each entry supports:
+#   name                    - required
+#   password                - inline plaintext password
+#   password_path           - local file containing the password
+#   password_url            - fetched (same BOOTSTRAP_CONFIG_TOKEN
+#                             bearer-token support as the config url itself)
+#   password_secret_id      - a Bitwarden Secrets Manager secret ID (needs
+#                             secret_manager: bws above and
+#                             $env:BWS_ACCESS_TOKEN set)
+#   generate: true          - auto-generate a strong random password
+#   ask: true               - prompt for the password twice (interactively)
+#   admin                   - optional, default false - local
+#                             Administrators group membership
+#   password_never_expires  - optional, default false
+#   initialize_profile      - optional, default true - force-creates the
+#                             account's real Windows profile right after
+#                             creation (via a one-shot scheduled task
+#                             logon), so e.g. its ssh_keys can be applied
+#                             in the same run instead of needing a manual
+#                             logon first. Only works for accounts
+#                             created in this same run (an existing
+#                             account's current password isn't known to
+#                             this script). Set false to opt out.
+#   complete_setup_on_first_login - optional, default true - schedules
+#                             this account's scope: user apps (see the
+#                             apps section) to install automatically the
+#                             next time this account actually logs in
+#                             interactively (a batch-logon-created
+#                             profile isn't enough for winget --scope
+#                             user to work - it needs a real session).
+#                             Result logged to
+#                             C:\ProgramData\win-bootstrap\first-login-<name>.log.
+#                             Set false to opt out.
+#   disabled                - optional, default false - skip just this
+#                             entry, keeping it here for later (or wrap
+#                             the whole list as { disabled: true, items:
+#                             [...] } to skip every account at once - see
+#                             the top-of-file note on disabled: true)
+#
+# Exactly one of password / password_path / password_url /
+# password_secret_id / generate / ask must be given.
+#
+# generate, and ask when run with -Quiet (no console to prompt on, so ask
+# falls back to generate's behavior), are the only options where a real
+# secret never has to be written into this file at all: the account is
+# forced to change its password at next interactive logon, and the
+# generated value is revealed exactly once - printed to the console if
+# interactive, or (in -Quiet mode, since output may just scroll into an
+# unattended log) written to a locked-down file next to this script named
+# "<name>.generated-password.txt" for you to read, use to change the
+# password, then delete.
+#
+# Windows has no supported way to create an account from a pre-computed
+# password hash - a plaintext value is unavoidable one way or another,
+# whichever source you pick.
+#
+# admin is reconciled on every run (added/removed to match config);
+# password_never_expires is only applied when the account is first
+# created. If an account with this name already exists, its password is
+# never touched by a later run - only group membership is kept in sync.
+local_users:
+  - name: contractor
+    generate: true
+    admin: false
+    # disabled: true
+    # ask: true
+    # password: "REPLACE-WITH-AN-ACTUAL-STRONG-PASSWORD"
+    # password_path: C:\path\to\password.txt
+    # password_url: https://example.com/password
+    # password_secret_id: 00000000-0000-0000-0000-000000000000
+    # ssh_keys: default
+    # 'default' above reuses ssh_server.authorized_keys below; alternatively
+    # give a list of explicit "ssh-... comment" lines and/or
+    # { key_secret_id: <id> } maps (a Bitwarden Secrets Manager secret ID -
+    # see ssh_server.authorized_keys below for the same pattern), e.g.:
+    #   ssh_keys:
+    #     - "ssh-ed25519 AAAA...replace-with-your-actual-public-key... your-comment"
+    #     - key_secret_id: 00000000-0000-0000-0000-000000000000
+    # Omit entirely = no SSH key configured for this user. Admin accounts
+    # share one file (administrators_authorized_keys) regardless of which
+    # key is listed for which user; non-admin accounts get their own
+    # per-user authorized_keys.
+
+# ----------------------------------------------------------------------------
+# sudo
+# ----------------------------------------------------------------------------
+# Configures Windows' built-in `sudo` command (Windows 11 24H2+ only -
+# https://learn.microsoft.com/en-us/windows/advanced-settings/sudo/).
+# mode is disabled | force_new_window | disable_input | normal:
+#   disabled          - sudo refuses to run (Windows' own default)
+#   force_new_window  - runs elevated in a new window (like runas) -
+#                        Microsoft's own recommended default if enabling
+#                        this at all
+#   disable_input     - runs attached to the current console, but the
+#                        elevated process can't receive input from it
+#   normal            - full input/output in the current console, most
+#                        convenient but carries the most risk (Microsoft's
+#                        own docs: an unelevated process could in
+#                        principle drive the elevated session)
+#
+# Omitting this section leaves whatever's currently configured alone;
+# mode: disabled actively turns it off (same "explicit value acts,
+# omission doesn't" convention as firewall.ping: block above).
+sudo:
+  mode: force_new_window
+
+# ----------------------------------------------------------------------------
+# disable_winssh_agent
+# ----------------------------------------------------------------------------
+# Stops and disables the Windows ssh-agent service so a third-party SSH
+# agent (e.g. Bitwarden's built-in one) can take over its named pipe. Only
+# has an effect if Bitwarden is actually detected as installed.
+disable_winssh_agent: true
+
+# ----------------------------------------------------------------------------
+# ssh_server
+# ----------------------------------------------------------------------------
+# Enables OpenSSH Server. With no authorized_keys, the server still runs
+# but only accepts password authentication. default_shell is optional -
+# cmd | pwsh5 (Windows PowerShell 5.1) | pwsh7 (PowerShell 7) - omit it to
+# leave Windows' own cmd.exe default alone. Any unavailable/misspelled
+# shell fails this step with a clear error instead of silently doing
+# nothing; pwsh7 here relies on install_powershell7 above having installed
+# the native MSI build.
+#
+# host_keys is optional - without it, sshd auto-generates its own host
+# key(s) whenever one is missing, which silently changes this machine's
+# SSH identity/fingerprint and breaks every client's known_hosts trust.
+# Pin specific key material here (type: rsa | ecdsa | ed25519 - ed25519
+# alone is enough for identity purposes) to keep the same identity across
+# reprovisioning; same inline-value/path/url/secret_id choice as root_ca's
+# cert below (private_key / private_key_path / private_key_url /
+# private_key_secret_id, pick exactly one). The matching public key is
+# derived automatically - no need to supply it separately. Generate a key
+# to pin with e.g.:
+#   ssh-keygen -t ed25519 -f ssh_host_ed25519_key -N ""
+ssh_server:
+  enable: true
+  default_shell: pwsh7
+  host_keys:
+    - type: ed25519
+      private_key: |
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        REPLACE-WITH-YOUR-ACTUAL-GENERATED-HOST-PRIVATE-KEY
+        -----END OPENSSH PRIVATE KEY-----
+      # private_key_path: C:\path\to\ssh_host_ed25519_key
+      # private_key_url: https://example.com/ssh_host_ed25519_key
+      # private_key_secret_id: 00000000-0000-0000-0000-000000000000
+  authorized_keys:
+    - "ssh-ed25519 AAAA...replace-with-your-actual-public-key... your-comment"
+    # Each entry is either a literal string like above, or a
+    # { key_secret_id: <id> } map fetched from Bitwarden Secrets Manager -
+    # handy for a shared/personal access key reused across machines
+    # instead of pasting the same key text into every config:
+    # - key_secret_id: 00000000-0000-0000-0000-000000000000
+
+# ----------------------------------------------------------------------------
+# root_ca
+# ----------------------------------------------------------------------------
+# Install one or more root CA certificates. Each entry needs exactly one of
+# cert (inline PEM), cert_path (local file), cert_url (fetched, same
+# BOOTSTRAP_CONFIG_TOKEN bearer-token support as the config URL itself), or
+# cert_secret_id (a Bitwarden Secrets Manager secret ID - needs
+# secret_manager: bws above and $env:BWS_ACCESS_TOKEN set).
+# install: false skips just that one entry; wrap the whole list as
+# { disabled: true, items: [...] } to skip every cert at once (see the
+# top-of-file note on disabled: true).
+root_ca:
+  - name: my-corporate-root-ca
+    install: true
+    cert: |
+      -----BEGIN CERTIFICATE-----
+      REPLACE-WITH-YOUR-ACTUAL-BASE64-CERTIFICATE-CONTENT
+      -----END CERTIFICATE-----
+    # cert_path: C:\path\to\ca.pem
+    # cert_url: https://example.com/ca.pem
+    # cert_secret_id: 00000000-0000-0000-0000-000000000000
+
+# ----------------------------------------------------------------------------
+# apps
+# ----------------------------------------------------------------------------
+# Apps to install via winget. scope defaults to "machine" if omitted.
+# platforms optionally restricts an entry to specific architectures
+# (arm64/x64); omit it to let winget pick the best build automatically.
+# architecture optionally pins a specific build; if that pin turns out to
+# be unsupported for the package, install falls back to automatic
+# selection instead of failing outright. installer_type optionally forces
+# a specific winget installer type (e.g. "wix" for a package's native MSI
+# build instead of its default). Note: winget won't switch installer types
+# on a package that's already installed (it just reports "No available
+# upgrade found") - uninstall it first (winget uninstall --id <id>
+# --source winget) and re-run this script if you're changing
+# installer_type on a machine that already has the app. PowerShell 7 and
+# Windows Terminal are NOT listed here - see install_powershell7 and
+# windows_terminal above, they're special-cased.
+#
+# disabled (optional, default false) skips just that one entry, keeping it
+# here for later - or wrap the whole list as { disabled: true, items: [...] }
+# to skip installing every app at once (see the top-of-file note on
+# disabled: true).
+#
+# scope: machine - some installers drop Start Menu shortcuts under only
+# the CURRENT user's profile even for a machine-wide install; any new
+# shortcut that appears there gets copied into the shared all-users
+# Start Menu automatically, so other accounts can see it too.
+#
+# scope: user - installs into whoever runs this script. Skipped
+# outright if delete_bootstrap_user is true (that account is about to
+# be deleted). Independently, each local_users account with
+# complete_setup_on_first_login gets its own copy of every scope: user
+# app installed automatically the next time THAT account logs in for
+# real - see local_users above.
+#
+# desktop_shortcut (optional, default false) picks a single shortcut for
+# the app and copies it to a desktop too - the shared all-users desktop
+# for scope: machine, or that specific account's own desktop for
+# scope: user (created at THAT account's own first-login setup, same
+# timing as the app install itself). Prefers a shortcut the installer
+# already dropped directly on a desktop itself (most reliable, always a
+# single correctly-iconed .lnk); otherwise falls back to the Start Menu,
+# picking a single flat .lnk directly, or - if the installer instead
+# created a subfolder (confirmed for Ghisler.TotalCommander: Help +
+# Uninstall alongside the real one) - the one shortcut left after
+# filtering out obvious non-launcher entries (uninstall/help/readme/
+# etc). If that's still ambiguous, nothing is copied and a warning is
+# printed instead of guessing. Taskbar pinning is intentionally not
+# offered (see windows_terminal above).
+apps:
+  - id: Google.Chrome
+    scope: machine
+  - id: Git.Git
+    scope: machine
+    desktop_shortcut: true
+  - id: Microsoft.VisualStudioCode
+    scope: user
+    desktop_shortcut: true
+  - id: 7zip.7zip
+    scope: machine
+    # architecture: arm64
+    # installer_type: wix
+    # disabled: true
+  # platforms restricts an entry to specific architectures - this one is
+  # arm64-only and simply won't be installed on an x64 machine.
+  - id: Highresolution.X-MouseButtonControl
+    scope: machine
+    platforms: [arm64]
+
+# ----------------------------------------------------------------------------
+# crash_dump
+# ----------------------------------------------------------------------------
+# Configures what kind of memory dump Windows writes on a crash (BSOD).
+# Omit this whole section to leave Windows' own default untouched.
+# type is one of:
+#   none      - no dump written at all
+#   complete  - full physical memory dump (large, needs a page file at
+#               least as big as RAM)
+#   kernel    - kernel memory only (smaller, usually enough to debug)
+#   small     - a 256 KB "minidump" (written to dump_file's directory
+#               under the default Minidump folder, not dump_file itself)
+#   automatic - like kernel, but lets Windows manage the page file size
+#               needed for it (Windows' own modern recommended default)
+#   active    - like automatic, further reduced by excluding memory pages
+#               unlikely to be useful (Windows 10 2004+/Server 2019+)
+crash_dump:
+  type: automatic
+  # dump_file: C:\Windows\MEMORY.DMP   # optional - omit for Windows' own default path
+  # overwrite: true                     # optional - omit for Windows' own default (true)
+
+# ----------------------------------------------------------------------------
+# kernel_debugging
+# ----------------------------------------------------------------------------
+# Enables Windows kernel debugging (the bcdedit /debug + /dbgsettings
+# combo normally used to attach WinDbg). Omit/enable: false = leave
+# alone, never touches BCD. A reboot is required for changes here to
+# actually take effect.
+#
+# target: current | dedicated
+#   current   - enables debug on today's default boot entry, in place.
+#   dedicated - finds or creates ONE script-managed copy of it (a fixed,
+#               recognizable boot entry - never duplicated on reruns) and
+#               enables debug there instead, leaving the original entry
+#               completely untouched.
+#
+# default_profile: current | dedicated (optional, default: current)
+#   Only consulted when target: dedicated (harmless no-op with
+#   target: current, since there's only one entry either way).
+#   current   - (the default) boots into the original entry as before;
+#               the dedicated debug entry is only reachable by picking it
+#               from the boot menu when you actually want to debug.
+#   dedicated - switches the boot default to the dedicated debug entry.
+#
+# legacy_boot_menu: true | false (optional, default: false)
+#   Switches EVERY boot loader entry's bootmenupolicy to Legacy (classic
+#   text-based boot menu, also re-enables F8 Advanced Options) - all
+#   entries at once, not just the dedicated debug one, since Windows only
+#   supports this per-entry, not as a single global switch. Mainly useful
+#   with target: dedicated when picking a boot entry over a serial
+#   console/remote KVM where the modern graphical boot menu doesn't
+#   render well.
+#
+# transport: serial | network - which one is read depends on this value;
+# the other block can be left in place unused, same as elsewhere in this
+# config. Note dbgsettings is a single GLOBAL BCD object shared by *any*
+# entry with debug on, not per-entry - relevant if you ever have more
+# than one debug-enabled entry at once.
+kernel_debugging:
+  enable: true
+  target: dedicated
+  # default_profile: dedicated
+  # legacy_boot_menu: true
+  transport: serial
+  serial:
+    port: COM1
+    baud_rate: 115200
+  # network:
+  #   host_ip: 192.168.1.50
+  #   port: 50000
+  #   generate: true      # or key / key_path / key_url / key_secret_id - exactly one.
+  #                        # A generated key is only ever created once (like a generated
+  #                        # local_users password) - shown once on the console, or written
+  #                        # to kernel-debug-key.generated.txt next to the script if -Quiet.
+  #   # key: "an-explicit-shared-secret"
+  #   # key_path: C:\secrets\kernel-debug-key.txt
+  #   # key_url: https://internal.example.com/kernel-debug-key.txt
+  #   # key_secret_id: 00000000-0000-0000-0000-000000000000
+  #   # This key grants remote kernel debugging access - full control of the
+  #   # machine - so treat it with at least as much care as a root CA
+  #   # private key or an admin password, not as a lesser "debug setting".
+
+# ----------------------------------------------------------------------------
+# windows_product_key
+# ----------------------------------------------------------------------------
+# Installs a Windows product key and requests online activation, via the
+# same WMI methods slmgr.vbs uses internally. Exactly one of the 4
+# fields below. Windows never exposes a fully-installed key back out
+# (only its last 5 characters), so verification is a suffix comparison:
+# an already-activated machine whose installed key ends the same way is
+# left untouched rather than overwritten. If the key installs but
+# activation fails (e.g. no network at bootstrap time), that's logged
+# as a warning, not a hard failure - re-run later to retry activation.
+# windows_product_key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+# windows_product_key_path: C:\secrets\windows-key.txt
+# windows_product_key_url: https://internal.example.com/windows-key.txt
+# windows_product_key_secret_id: 00000000-0000-0000-0000-000000000000
+
+# ----------------------------------------------------------------------------
+# power
+# ----------------------------------------------------------------------------
+# Sets sleep/display timeouts via the same powercfg /change mechanism as
+# Windows' own Settings app, applied to whichever power plan is currently
+# active. All four fields below are independent and optional - set only
+# the ones you care about, the rest are left exactly as they already are.
+# Value is "never" or a whole number of minutes.
+#
+# Many VMs (confirmed for QEMU/KVM guests) have virtual firmware that
+# doesn't expose any ACPI sleep state at all (powercfg /a reports every
+# S-state as unavailable) - Windows then hides the "Put my device to
+# sleep" control from Settings entirely, showing only the display
+# timeout. Setting sleep_after.on_power/on_battery here still works
+# without error on such a machine - powercfg /change only ever writes
+# the value into the power scheme, so it's a harmless no-op if the
+# underlying sleep state was never reachable to begin with.
+#
+# disabled (optional, default false) skips this whole section.
+power:
+  sleep_after:
+    on_power: never
+    on_battery: never
+  # display_off_after:
+  #   on_power: 15
+  #   on_battery: 5
+  # disabled: true
+
+# ----------------------------------------------------------------------------
+# network
+# ----------------------------------------------------------------------------
+# Static IP/gateway/DNS/MAC configuration. ip/dns/mac_address are each
+# independent and optional - set only what you need (e.g. mac_address
+# alone, with no static IP, just to pin a DHCP reservation). At least one
+# of ip/dns/mac_address must be set, or this step is skipped. gateway
+# only makes sense together with ip and is rejected on its own.
+#
+# mac_address never applies live - it's written straight to the adapter
+# driver's registry key (no live effect - the driver only reads it back
+# at its next load) rather than via Set-NetAdapterAdvancedProperty (which
+# forces an immediate live driver reset). Skipped (with a warning,
+# everything else still applies) on adapters whose driver doesn't
+# support a MAC override. This always just flags that a reboot is
+# needed, regardless of apply_after_reboot below - see "Reboot handling"
+# in the docs for when that reboot actually happens.
+#
+# apply_after_reboot (default true) controls WHEN ip/gateway/dns is
+# applied (mac_address is unaffected by this - see above):
+# - true (safe): schedules a SYSTEM scheduled task that applies the
+#   settings ~30s after the next reboot, and re-applies them on every
+#   subsequent boot too (correcting drift) - re-registered with the
+#   latest config values on every bootstrap run.
+# - false: applies immediately, which can drop THIS session if it's
+#   connected over the same network (SSH/RDP) - confirmation-gated
+#   (types YES, same as recovery_partition's delete) and deferred to the
+#   very end of the run, after the final summary.
+#
+# interface (optional) is the adapter name - auto-detected via the
+# current default route if omitted.
+#
+# disabled (optional, default false) skips this whole section.
+# network:
+#   interface: Ethernet
+#   ip: 192.168.1.50/24
+#   gateway: 192.168.1.1
+#   dns:
+#     - 192.168.1.1
+#     - 8.8.8.8
+#   mac_address: 00:11:22:33:44:55
+#   apply_after_reboot: true
+
+# ----------------------------------------------------------------------------
+# delete_bootstrap_user
+# ----------------------------------------------------------------------------
+# Permanently deletes the local account that ran this script
+# ($env:USERNAME) - useful when bootstrap runs under a temporary
+# provisioning account that shouldn't remain once a real admin account
+# exists (e.g. one set up via local_users above). This is deliberately
+# the LAST step of a real run, after the final summary is printed:
+#   - Hard refusal, no override, if it would leave the machine with zero
+#     other enabled local Administrator accounts (checked against live
+#     machine state).
+#   - Same confirmation gate as recovery_partition.delete above - prompts
+#     for a literal YES unless -Quiet.
+#   - If the deletion itself fails (e.g. an active logon session), the
+#     script warns and recommends a reboot + re-run instead of hanging.
+# Omit/false leaves the account alone.
+# delete_bootstrap_user: true
