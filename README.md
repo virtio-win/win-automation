@@ -19,10 +19,6 @@ All documentation for both areas lives under [`docs/`](docs/); the code folders 
 - [Visual Studio build environment](docs/visual-studio-env.md)
 - [UTM WebDAV file size limit](docs/utm-webdav-limit.md)
 
-### Verification
-
-- [Regression and VM testing](docs/testing.md)
-
 ## win-bootstrap
 
 A generic, config-driven bootstrap engine for a freshly installed Windows machine (Windows 10/11, x64 or arm64). Every action is driven by an external YAML config, so the same script works for anyone.
