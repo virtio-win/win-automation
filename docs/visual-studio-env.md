@@ -1,6 +1,6 @@
 # Visual Studio Build Environment
 
-`setup-vs2022-env.ps1` / `setup-vs2026-env.ps1` set up a full Visual Studio development environment for building and debugging Windows drivers from the [kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows/) repository. After either script completes, you can open `virtio-win.sln` and the drivers are ready to build. The scripts do not clone the driver repository or build it; obtain that repository separately. On a later run they check the installed components and update/repair the Visual Studio installation when the selected mode requests it.
+`setup-vs2022-env.ps1` / `setup-vs2026-env.ps1` set up a full Visual Studio development environment for building and debugging Windows drivers from the [kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows/) repository. The scripts do not clone that repository or build it: obtain it separately, then open its `virtio-win.sln` after either setup script completes. The drivers are then ready to build. On a later run the scripts check the installed components and update/repair the Visual Studio installation when the selected mode requests it.
 
 ## setup-vs2022-env
 

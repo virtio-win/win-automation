@@ -483,9 +483,9 @@ root_ca:
 # real - see local_users above. The first-login helper receives only id and
 # desktop_shortcut: platforms, architecture, and installer_type are NOT
 # carried over. Do not rely on those options to constrain first-login installs.
-# It also ignores whole-list apps.disabled (unlike per-entry disabled).
-# To prevent new first-login scheduling, disable each relevant app entry,
-# set complete_setup_on_first_login: false for the user, or -Skip first_login.
+# Whole-list apps.disabled also prevents new first-login scheduling. You can
+# instead disable each relevant app entry, set complete_setup_on_first_login:
+# false for the user, or use -Skip first_login.
 # These controls do not remove tasks already registered by an earlier run.
 #
 # desktop_shortcut (optional, default false) picks a single shortcut for

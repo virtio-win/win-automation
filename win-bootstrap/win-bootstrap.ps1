@@ -123,7 +123,8 @@
     OK / NOT APPLIED / ERROR (or UNKNOWN if that step has no verification
     check implemented) - never makes any changes. Steps skipped by config/
     -Only/-Skip are still reported as SKIPPED, same as a normal run. Still
-    requires elevation, same as a normal run.
+    requires elevation, same as a normal run. Exits 1 when verification
+    reports NOT APPLIED or ERROR for any step; otherwise exits 0.
 
 .PARAMETER ValidateConfig
     Standalone, no-elevation config check: resolves, fetches, parses, and
@@ -172,14 +173,15 @@
     recovery_partition) take it directly inside the map. List sections
     (root_ca, defender_exclusions, smb_shares, local_users, apps) take it
     per-entry to disable just one item, or on the whole list at once by
-    wrapping it as "<key>: { disabled: true, items: [...] }" instead of a
-    bare list - both shapes are accepted. windows_terminal and ssh_server
+    replacing the bare list with a block map containing "disabled: true"
+    and an "items:" list - both shapes are accepted. windows_terminal and ssh_server
     already have the whole-section effect via their own "enable: false",
     and root_ca entries individually via "install: false".
 
 .PARAMETER Quiet
-    Non-interactive mode. Skips the confirmation prompt before removing the
-    recovery partition (auto-approved). If the script is not already running
+    Non-interactive mode. Automatically confirms risky actions, including
+    recovery-partition removal, bootstrap-user deletion, immediate network
+    changes, and a required reboot. If the script is not already running
     elevated, it exits with an error instead of prompting to relaunch.
 
 .EXAMPLE
@@ -264,18 +266,25 @@ $ProgressPreference = 'SilentlyContinue'
 # Full console transcript, independent of whatever window/session started
 # this run - useful because 'delete_bootstrap_user' can end that very
 # session partway through (see below), and a scheduled-task-driven run
-# has no visible window to read at all. Written to C:\ProgramData (not
-# any user profile) so it survives the bootstrap account itself being
-# deleted. Validation and verification deliberately do not create a
-# persistent log: they may fetch private config and resolve secrets, and
-# neither mode needs a durable transcript.
+# has no visible window to read at all. Written below the protected Windows
+# log directory, not under any user profile or the first-login artifact
+# directory, so standard users cannot pre-create or replace its parent.
+# Validation and verification deliberately do not create a persistent log:
+# they may fetch private config and resolve secrets, and neither mode needs
+# a durable transcript.
 $script:TranscriptActive = $false
-# Keep transcripts separate from the shared directory used by first-login
-# scripts, logs, and completion markers. Those artifacts run as the target
-# user and must remain readable/writable by that task's account.
-$script:TranscriptBaseDir = 'C:\ProgramData\win-bootstrap\transcripts'
+$script:TranscriptBaseDir = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'Logs\win-bootstrap'
 $script:TranscriptPath = $null
 $script:ConfigAuthOrigin = $null
+
+function Assert-NotReparsePoint {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Refusing reparse point at protected transcript path '$Path'."
+    }
+}
 
 function Set-BootstrapTranscriptAcl {
     param(
@@ -283,6 +292,8 @@ function Set-BootstrapTranscriptAcl {
         [switch]$Directory,
         [switch]$AllowCurrentUser
     )
+
+    Assert-NotReparsePoint -Path $Path
 
     # Use stable SIDs rather than localized account names. Replace the whole
     # DACL, rather than merely adding/replacing two grants: an old explicit
@@ -324,13 +335,21 @@ function Set-BootstrapTranscriptAcl {
 function Start-BootstrapTranscript {
     if ($script:TranscriptActive) { return }
     try {
+        Assert-NotReparsePoint -Path $script:TranscriptBaseDir
         if (-not (Test-Path $script:TranscriptBaseDir)) {
             New-Item -ItemType Directory -Path $script:TranscriptBaseDir -Force | Out-Null
         }
+        Assert-NotReparsePoint -Path $script:TranscriptBaseDir
         Set-BootstrapTranscriptAcl -Path $script:TranscriptBaseDir -Directory
         Get-ChildItem -Path $script:TranscriptBaseDir -Filter 'bootstrap-run-*.log' -File -ErrorAction SilentlyContinue |
-            ForEach-Object { Set-BootstrapTranscriptAcl -Path $_.FullName }
-        $script:TranscriptPath = Join-Path $script:TranscriptBaseDir "bootstrap-run-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+            ForEach-Object {
+                Assert-NotReparsePoint -Path $_.FullName
+                Set-BootstrapTranscriptAcl -Path $_.FullName
+            }
+        if (-not $script:TranscriptPath) {
+            $script:TranscriptPath = Join-Path $script:TranscriptBaseDir "bootstrap-run-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        }
+        Assert-NotReparsePoint -Path $script:TranscriptPath
         Start-Transcript -Path $script:TranscriptPath -Append | Out-Null
         $script:TranscriptActive = $true
         try {
@@ -380,10 +399,6 @@ function Invoke-WithoutBootstrapTranscript {
             }
         }
     }
-}
-
-if (-not $ValidateConfig -and -not $Verify) {
-    Start-BootstrapTranscript
 }
 
 # ----------------------------------------------------------------------------
@@ -2794,6 +2809,13 @@ if (-not (Test-IsAdmin)) {
     exit 0
 }
 
+# The protected transcript directory requires elevation. Starting it only
+# after this gate prevents a non-admin parent process from producing a
+# misleading access-denied warning before it relaunches elevated.
+if (-not $ValidateConfig -and -not $Verify) {
+    Start-BootstrapTranscript
+}
+
 # ----------------------------------------------------------------------------
 # 2. Architecture detection
 # ----------------------------------------------------------------------------
@@ -4665,14 +4687,19 @@ else {
         $userName = Get-ConfigValue $entry @('name')
         $userDisabled = Get-ConfigValue $entry @('disabled') $false
         $completeSetupOnFirstLogin = Get-ConfigValue $entry @('complete_setup_on_first_login') $true
-        $userScopeAppsForLogin = @($apps | Where-Object {
-            (Get-ConfigValue $_ @('scope') 'machine') -eq 'user' -and -not (Get-ConfigValue $_ @('disabled') $false)
-        } | ForEach-Object {
-            [pscustomobject]@{
-                Id              = Get-ConfigValue $_ @('id')
-                DesktopShortcut = Get-ConfigValue $_ @('desktop_shortcut') $false
-            }
-        })
+        $userScopeAppsForLogin = if ($appsDisabled) {
+            @()
+        }
+        else {
+            @($apps | Where-Object {
+                (Get-ConfigValue $_ @('scope') 'machine') -eq 'user' -and -not (Get-ConfigValue $_ @('disabled') $false)
+            } | ForEach-Object {
+                [pscustomobject]@{
+                    Id              = Get-ConfigValue $_ @('id')
+                    DesktopShortcut = Get-ConfigValue $_ @('desktop_shortcut') $false
+                }
+            })
+        }
 
         $firstLoginSkip = if ($localUsersDisabled) {
             "'local_users.disabled' is set to true"
@@ -4680,6 +4707,8 @@ else {
             "'disabled: true' for user '$userName'"
         } elseif (-not $completeSetupOnFirstLogin) {
             "'complete_setup_on_first_login: false' for user '$userName'"
+        } elseif ($appsDisabled) {
+            "'apps.disabled' is set to true"
         } elseif ($userScopeAppsForLogin.Count -eq 0) {
             "no 'scope: user' apps configured"
         } else { $null }

@@ -9,7 +9,7 @@ The table below describes the current implementation. It is not a guarantee that
 | Capability | Windows 10/11 | Server 2019 | Server 2022 | Server 2025 |
 | --- | --- | --- | --- | --- |
 | Core machine configuration | Supported | Limited; not end-to-end validated | Limited; not end-to-end validated | Limited; not end-to-end validated |
-| WinGet app installation | Supported when available | Not available by default | Not available by default | Available, subject to image/features |
+| WinGet app installation | Supported when available | Not available by default | Not available by default | Available with Desktop Experience |
 | PowerShell 7 installation | WinGet required | Limited; WinGet required | Limited; WinGet required | Limited; WinGet required |
 | Windows Terminal | Client/desktop only | Not supported | Limited; WinGet required | Desktop Experience only |
 | OpenSSH Server | Supported | Limited; current flow uses WinGet | Limited; current flow uses WinGet | Limited; current flow uses WinGet |
@@ -20,7 +20,7 @@ The table below describes the current implementation. It is not a guarantee that
 ## Important Windows Server limitations
 
 - **WinGet dependencies:** the current `apps`, `install_powershell7`,
-  `windows_terminal`, and `ssh_server` implementations depend on WinGet. WinGet is available by default on Windows Server 2025, but not on Windows Server 2019 or 2022. Manually adding WinGet to those releases is outside the supported bootstrap workflow.
+  `windows_terminal`, and `ssh_server` implementations depend on WinGet. WinGet is available by default on Windows Server 2025 with Desktop Experience, but not on Server Core installations, Windows Server 2019, or Windows Server 2022. Manually adding WinGet to unsupported images is outside the supported bootstrap workflow.
 - **OpenSSH:** Windows Server 2019 and 2022 provide OpenSSH Server as a Windows
   capability. Windows Server 2025 includes it by default. The bootstrap script does not currently use these server-native installation paths.
 - **Server Core:** GUI-oriented operations, Windows Terminal, desktop
