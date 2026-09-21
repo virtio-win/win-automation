@@ -6,6 +6,10 @@ Core functionality is also expected to work on Windows Server 2019, 2022, and 20
 
 ## TL;DR
 
+Choose the path that matches how the machine receives its configuration. In every case, run the final apply command from an elevated PowerShell session, or allow the script to offer a UAC relaunch. `-Quiet` is non-interactive: it auto-confirms confirmation-gated risky operations, fails if elevation is unavailable, and may reboot when configured changes require it.
+
+### 1. Local script and local config
+
 From the repository's `win-bootstrap` directory, create a deliberately small config. Validate it first, then apply it. The validation command needs no elevation and does not apply any machine changes:
 
 ```powershell
@@ -19,7 +23,62 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 -Con
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml
 ```
 
-Run the final command from an elevated PowerShell session, or let the script offer a UAC relaunch. `-Quiet` is non-interactive: it auto-confirms confirmation-gated risky operations, fails if elevation is unavailable, and may reboot when the configured changes require it. See [Quick Use](#quick-use) for execution notes and [Deployment](#deployment) for URL, private-config, corporate-CA, and Bitwarden scenarios.
+### 2. Public script and private config URL
+
+Keep the script in this public repository and your machine-specific config in a separate private GitHub repository or configuration service. `BOOTSTRAP_CONFIG_TOKEN` is the **HTTP authorization token for downloading that config URL**; it is not a Bitwarden token and it is not written into the YAML config. The script sends its value as this request header:
+
+```text
+Authorization: Bearer <value of BOOTSTRAP_CONFIG_TOKEN>
+```
+
+For GitHub, create a **fine-grained personal access token** restricted to the one private config repository, with repository permission **Contents: Read-only**. If the organization requires SSO authorization for tokens, authorize it there as well. A classic PAT with `repo` scope can also read a private repository, but grants far broader access and is not recommended for this use. Put only the opaque token value in the environment variable — do not include the `Bearer ` prefix. The value must be a single line (no CR/LF). Set it through your provisioning system or CI secret injection where possible. The literal assignment below is only an interactive example and can leave the value in shell history.
+
+```powershell
+$scriptUrl = 'https://raw.githubusercontent.com/<owner>/<repo>/<ref>/win-bootstrap/win-bootstrap.ps1'
+$configUrl = 'https://raw.githubusercontent.com/<owner>/<private-config-repo>/<ref>/win-bootstrap.config.yaml'
+
+$env:BOOTSTRAP_CONFIG_TOKEN = '<fine-grained-GitHub-PAT>'
+Invoke-WebRequest -Uri $scriptUrl -OutFile "$env:TEMP\win-bootstrap.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\win-bootstrap.ps1" -ConfigUrl $configUrl
+```
+
+The bearer token is sent only to the config URL's exact origin (scheme, host, and port). A redirect to another origin is rejected while authentication is in use. For GitHub, the raw URL must name the private config repository, ref, and file path exactly. For another config provider, replace this URL and use that provider's token type only if it accepts HTTP Bearer authentication. See [Config source](#config-source) for source precedence and authentication details.
+
+### 3. Private config behind an untrusted corporate CA
+
+If the config URL is behind a TLS-inspecting proxy or uses an internal CA, bootstrap must trust that CA *before* it can download the config. Prefer `-ConfigCaUrl` when the CA certificate itself is available from a normally trusted HTTPS endpoint:
+
+```powershell
+$env:BOOTSTRAP_CONFIG_TOKEN = '<private-config-access-token>'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 `
+  -ConfigUrl 'https://config.example.com/windows/win-bootstrap.config.yaml' `
+  -ConfigCaUrl 'https://downloads.example.com/certificates/corporate-root-ca.pem'
+```
+
+Use `-ConfigCaPath C:\path\to\corporate-root-ca.pem` when the certificate is already on the machine. `-ConfigUrlInsecureSkipCertCheck` exists only as a last resort for a config URL that is already trusted by another channel; it disables validation for that one fetch. See [Certificate trust for the config fetch itself](#certificate-trust-for-the-config-fetch-itself).
+
+### 4. Bitwarden Secrets Manager for values inside the config
+
+Use `_secret_id` fields when the config must refer to passwords, private keys, certificates, or kernel-debugging keys without containing their values. This config can be stored in source control because the password remains in Bitwarden:
+
+```powershell
+@'
+secret_manager: bws
+local_users:
+  - name: builduser
+    password_secret_id: 00000000-0000-0000-0000-000000000000
+    admin: true
+    initialize_profile: false
+    complete_setup_on_first_login: false
+'@ | Set-Content .\win-bootstrap.config.yaml
+
+$env:BWS_ACCESS_TOKEN = '<bitwarden-machine-access-token>'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml
+```
+
+`BWS_ACCESS_TOKEN` is a Bitwarden Secrets Manager *machine access token*, not a Bitwarden vault password. Supply it through CI/provisioning secret injection when possible; an interactive literal assignment can be stored in shell history. The script installs and checksum-verifies `bws.exe` on first real use. See [Bitwarden Secrets Manager](#bitwarden-secrets-manager) for requirements and all supported secret fields.
+
+The private config token and `BWS_ACCESS_TOKEN` are independent: the first authorizes downloading the configuration; the second authorizes resolving the `_secret_id` values named by that configuration. A deployment may use either, both, or neither.
 
 ## Table of Contents
 
