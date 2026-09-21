@@ -90,6 +90,7 @@ function Import-ProductionFunctions {
 }
 
 $productionFunctionDefinitions = @(Import-ProductionFunctions -Name @(
+    'Assert-NotReparsePoint',
     'Set-BootstrapTranscriptAcl',
     'Start-BootstrapTranscript',
     'Stop-BootstrapTranscript',
@@ -240,6 +241,7 @@ Invoke-RegressionTest -Name 'normal fetch preserves same-origin auth and strips 
         $script:ConfigAuthOrigin = Get-UrlOrigin 'https://private.example.test:443/config.yaml'
         $script:BootstrapRegressionRequests = @()
         function global:Invoke-WebRequest {
+            [CmdletBinding()]
             param($Uri, $Headers, [switch]$UseBasicParsing, [int]$MaximumRedirection)
             $script:BootstrapRegressionRequests += [pscustomobject]@{ Uri = $Uri; Headers = $Headers }
             [pscustomobject]@{ StatusCode = 200; Content = 'ok'; Headers = @{} }
@@ -265,6 +267,7 @@ Invoke-RegressionTest -Name 'cross-origin authenticated redirect is rejected' -S
         $env:BOOTSTRAP_CONFIG_TOKEN = 'regression-token'
         $script:ConfigAuthOrigin = Get-UrlOrigin 'https://private.example.test/config.yaml'
         function global:Invoke-WebRequest {
+            [CmdletBinding()]
             param($Uri, $Headers, [switch]$UseBasicParsing, [int]$MaximumRedirection)
             [pscustomobject]@{
                 StatusCode = 302
@@ -288,6 +291,7 @@ Invoke-RegressionTest -Name 'HTTP error is not treated as a successful config fe
     try {
         $script:ConfigAuthOrigin = Get-UrlOrigin 'https://private.example.test/config.yaml'
         function global:Invoke-WebRequest {
+            [CmdletBinding()]
             param($Uri, $Headers, [switch]$UseBasicParsing, [int]$MaximumRedirection)
             [pscustomobject]@{ StatusCode = 503; Content = 'unavailable'; Headers = @{} }
         }
@@ -320,6 +324,7 @@ Invoke-RegressionTest -Name 'insecure curl fetch returns the downloaded body' -S
     try {
         $body = Get-ConfigText -Source ([pscustomobject]@{ Kind = 'Url'; Value = 'https://private.example.test/config.yaml' }) -SkipCertCheck
         Assert-True ($body -eq 'curl-regression-body') 'Insecure fetch returned null or the wrong body.'
+        Assert-True ($script:CapturedCurlArguments[0] -eq '-q') 'Insecure curl fetch does not disable default curl configuration first.'
         Assert-True (-not (($script:CapturedCurlArguments -join ' ').Contains('curl-regression-token'))) 'Bearer token was exposed in curl process arguments.'
     }
     finally {
@@ -429,13 +434,22 @@ Invoke-RegressionTest -Name 'first-login template keeps retryable state on insta
 
 Invoke-RegressionTest -Name 'transcript is disabled for validation and verification and ACL uses well-known SIDs' -ScriptBlock {
     $text = Get-Content -LiteralPath $ScriptPath -Raw
-    Assert-True ($text.Contains('if (-not $ValidateConfig -and -not $Verify)')) 'Startup transcript guard is missing.'
+    $transcriptGuardIndex = $text.LastIndexOf('if (-not $ValidateConfig -and -not $Verify)')
+    $elevationGateIndex = $text.IndexOf('if (-not (Test-IsAdmin))')
+    Assert-True ($transcriptGuardIndex -gt $elevationGateIndex) 'Transcript must start only after the elevation gate.'
     Assert-True ($text.Contains('S-1-5-18')) 'SYSTEM well-known SID is missing from transcript ACL.'
     Assert-True ($text.Contains('S-1-5-32-544')) 'Administrators well-known SID is missing from transcript ACL.'
-    Assert-True ($text.Contains('$script:TranscriptBaseDir = ''C:\ProgramData\win-bootstrap\transcripts''')) 'Transcript path is not isolated from first-login artifacts.'
+    Assert-True ($text.Contains("[Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'Logs\win-bootstrap'")) 'Transcript path is not rooted below the protected Windows log directory.'
+    Assert-True ($text.Contains('Assert-NotReparsePoint')) 'Transcript paths are not checked for reparse points.'
     Assert-True ($text.Contains('AllowCurrentUser')) 'Ephemeral curl header ACL lacks current-user support.'
     Assert-True ($text.Contains('Invoke-WithoutBootstrapTranscript')) 'Secret handoff does not suspend transcript.'
     Assert-True ($text.Contains('exit $script:BootstrapExitCode')) 'Bootstrap does not return an explicit aggregate process status.'
+}
+
+Invoke-RegressionTest -Name 'whole-list apps.disabled also skips first-login scheduling' -ScriptBlock {
+    $text = Get-Content -LiteralPath $ScriptPath -Raw
+    Assert-True ($text.Contains('$userScopeAppsForLogin = if ($appsDisabled)')) 'First-login app selection does not honor whole-list apps.disabled.'
+    Assert-True ($text.Contains('elseif ($appsDisabled)') -and $text.Contains("'apps.disabled' is set to true")) 'First-login scheduling has no explicit apps.disabled skip reason.'
 }
 
 Invoke-RegressionTest -Name 'protected transcript can start and stop in a temporary directory' -ScriptBlock {
@@ -445,6 +459,7 @@ Invoke-RegressionTest -Name 'protected transcript can start and stop in a tempor
     }
     Assert-ProductionFunctionAvailable -Name 'Start-BootstrapTranscript'
     Assert-ProductionFunctionAvailable -Name 'Stop-BootstrapTranscript'
+    Assert-ProductionFunctionAvailable -Name 'Assert-NotReparsePoint'
     $temporaryTranscriptDir = Join-Path ([IO.Path]::GetTempPath()) "bootstrap-regression-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $temporaryTranscriptDir -Force | Out-Null
     try {
@@ -465,9 +480,11 @@ Invoke-RegressionTest -Name 'protected transcript can start and stop in a tempor
         [void]$oldLogAcl.AddAccessRule($everyoneRule)
         Set-Acl -LiteralPath $oldLogPath -AclObject $oldLogAcl
         $script:TranscriptBaseDir = $temporaryTranscriptDir
+        $script:TranscriptPath = $null
         $script:TranscriptActive = $false
         Start-BootstrapTranscript
         Assert-True $script:TranscriptActive 'Protected transcript did not start.'
+        $firstTranscriptPath = $script:TranscriptPath
         Add-Content -Path (Join-Path $temporaryTranscriptDir 'bootstrap-runtime-marker.txt') -Value 'not part of transcript'
         $directorySids = @(Get-Acl $temporaryTranscriptDir).Access | ForEach-Object {
             $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
@@ -485,6 +502,9 @@ Invoke-RegressionTest -Name 'protected transcript can start and stop in a tempor
         Assert-True ($oldLogSids -notcontains 'S-1-1-0') 'Existing transcript retained an explicit Everyone ACE.'
         Stop-BootstrapTranscript
         Assert-True (-not $script:TranscriptActive) 'Protected transcript did not stop.'
+        Start-BootstrapTranscript
+        Assert-True ($script:TranscriptPath -eq $firstTranscriptPath) 'Transcript resume created a different log path.'
+        Stop-BootstrapTranscript
     }
     finally {
         if ($script:TranscriptActive) { Stop-BootstrapTranscript }
@@ -494,6 +514,7 @@ Invoke-RegressionTest -Name 'protected transcript can start and stop in a tempor
 
 Invoke-RegressionTest -Name 'insecure curl path avoids token argv and checks HTTP status' -ScriptBlock {
     $text = Get-Content -LiteralPath $ScriptPath -Raw
+    Assert-True ($text.Contains("`$curlArgs = @('-q', '-k'")) 'Insecure fetch does not disable default curl configuration first.'
     Assert-True (-not $text.Contains('$curlArgs = @(''-k'', ''-sS'', ''-L''')) 'Insecure fetch still uses curl automatic redirects.'
     Assert-True ($text.Contains('$curlArgs += @(''-H'', "@$headerFile")')) 'Insecure fetch does not use a temporary header file.'
     Assert-True ($text.Contains('if ($statusCode -ge 400)')) 'Insecure fetch does not reject HTTP errors.'

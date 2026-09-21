@@ -1396,7 +1396,10 @@ function Get-ConfigText {
             $requestUrl = $initialUrl
             $redirectCount = 0
             while ($true) {
-                $curlArgs = @('-k', '-sS', '-D', $responseHeadersFile, '-o', $tempFile, '-w', '%{http_code}', $requestUrl)
+                # -q must be curl's first argument: it prevents loading a
+                # user-controlled .curlrc/_curlrc which could otherwise
+                # redirect this -k request and receive its bearer token.
+                $curlArgs = @('-q', '-k', '-sS', '-D', $responseHeadersFile, '-o', $tempFile, '-w', '%{http_code}', $requestUrl)
                 if ($tokenEligible -and (Get-UrlOrigin -Url $requestUrl) -eq $script:ConfigAuthOrigin) {
                     if (-not (Test-Path $headerFile)) {
                         New-Item -ItemType File -Path $headerFile -Force | Out-Null
