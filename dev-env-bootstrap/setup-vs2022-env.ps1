@@ -5,7 +5,7 @@
 .DESCRIPTION
     Checks for and installs:
       - Visual Studio 2022 Community Edition (with driver dev components)
-      - Windows Driver Kit (WDK) 26000
+      - Windows Driver Kit (WDK) build 26100
       - WinFSP 2023 (v2.0) with Developer and Kernel Developer features
       - Cryptographic Provider Development Kit (CPDK) 8.0
 
@@ -151,6 +151,51 @@ function Start-InstallerWithProgress {
     return $proc.ExitCode
 }
 
+function Assert-InstallerSuccess {
+    param(
+        [int]$ExitCode,
+        [string]$StepName
+    )
+    if ($ExitCode -ne 0 -and $ExitCode -ne 3010) {
+        throw "$StepName exited with code $ExitCode"
+    }
+}
+
+function Test-WdkInstallation {
+    param(
+        [Parameter(Mandatory = $true)][string]$KitsRoot,
+        [Parameter(Mandatory = $true)][string]$RequiredBuild
+    )
+
+    $includeRoot = Join-Path $KitsRoot "Include"
+    if (-not (Test-Path -LiteralPath $includeRoot -PathType Container)) {
+        return $false
+    }
+
+    # WDK versions are commonly named 10.0.<build>.0. Parse the version so a
+    # matching revision or arbitrary folder name cannot satisfy the build check.
+    $requiredBuildNumber = [int]$RequiredBuild
+    $versionRoots = Get-ChildItem -LiteralPath $includeRoot -Directory -ErrorAction SilentlyContinue
+    foreach ($versionRoot in $versionRoots) {
+        $version = $null
+        if (-not [version]::TryParse($versionRoot.Name, [ref]$version) -or $version.Build -ne $requiredBuildNumber) {
+            continue
+        }
+        $kmPath = Join-Path $versionRoot.FullName "km"
+        $headerPath = Join-Path $kmPath "wdm.h"
+        $x64LibraryPath = Join-Path $KitsRoot "Lib\$($versionRoot.Name)\km\x64\ntoskrnl.lib"
+        $x86LibraryPath = Join-Path $KitsRoot "Lib\$($versionRoot.Name)\km\x86\ntoskrnl.lib"
+        $arm64LibraryPath = Join-Path $KitsRoot "Lib\$($versionRoot.Name)\km\arm64\ntoskrnl.lib"
+        if ((Test-Path -LiteralPath $headerPath -PathType Leaf) -and
+            ((Test-Path -LiteralPath $x64LibraryPath -PathType Leaf) -or
+             (Test-Path -LiteralPath $x86LibraryPath -PathType Leaf) -or
+             (Test-Path -LiteralPath $arm64LibraryPath -PathType Leaf))) {
+            return $true
+        }
+    }
+    return $false
+}
+
 # ---------------------------------------------
 # 1. Visual Studio 2022 Community Edition
 # ---------------------------------------------
@@ -245,20 +290,14 @@ if ($vsInstalled) {
             $exitCode = Start-InstallerWithProgress -FilePath $vsSetupExe `
                 -Arguments "update --installPath `"$vsInstallPath`" $vsUiMode --norestart --wait" `
                 -StepName "VS 2022 update"
-            if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-                Write-Warn "VS update exited with code $exitCode"
-            } else {
-                Write-Status "VS 2022 update completed."
-            }
+            Assert-InstallerSuccess -ExitCode $exitCode -StepName "VS 2022 update"
+            Write-Status "VS 2022 update completed."
 
             $exitCode = Start-InstallerWithProgress -FilePath $vsSetupExe `
                 -Arguments "modify --installPath `"$vsInstallPath`" --config `"$vsConfigPath`" $vsUiMode --norestart --wait" `
                 -StepName "VS 2022 modify"
-            if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-                Write-Warn "VS modify exited with code $exitCode"
-            } else {
-                Write-Status "VS 2022 components verified/installed."
-            }
+            Assert-InstallerSuccess -ExitCode $exitCode -StepName "VS 2022 modify"
+            Write-Status "VS 2022 components verified/installed."
 
             if ($exitCode -eq 3010) {
                 Write-Warn "A system restart is required to complete VS 2022 changes."
@@ -299,18 +338,19 @@ if ($vsInstalled) {
 }
 
 # ---------------------------------------------
-# 2. Windows Driver Kit (WDK) 26000
+# 2. Windows Driver Kit (WDK) build 26100
 # ---------------------------------------------
-Write-Section "Windows Driver Kit (WDK)"
+Write-Section "Windows Driver Kit (WDK) build 26100"
 
 $wdkInstalled = $false
 $wdkKitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-if (Test-Path $wdkKitsRoot) {
-    $kmPaths = Get-ChildItem (Join-Path $wdkKitsRoot "Include\*\km") -Directory -ErrorAction SilentlyContinue
-    if ($kmPaths) {
-        $wdkInstalled = $true
-        $wdkVersions = ($kmPaths | ForEach-Object { $_.Parent.Name }) -join ", "
-        Write-Status "WDK is installed (versions: $wdkVersions)"
+if (Test-Path -LiteralPath $wdkKitsRoot -PathType Container) {
+    $wdkInstalled = Test-WdkInstallation -KitsRoot $wdkKitsRoot -RequiredBuild "26100"
+    $kmPaths = Get-ChildItem -LiteralPath (Join-Path $wdkKitsRoot "Include") -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "km") -PathType Container }
+    if ($wdkInstalled) {
+        $wdkVersions = ($kmPaths | ForEach-Object { $_.Name }) -join ", "
+        Write-Status "WDK build 26100 is installed (available versions: $wdkVersions)"
     }
 }
 
@@ -329,15 +369,13 @@ if (-not $wdkInstalled) {
         $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2335869"
         $wdkSetupExe = Join-Path $tempDir "wdksetup.exe"
         try {
-            Get-Installer -Url $wdkUrl -OutFile $wdkSetupExe -DisplayName "WDK 26000 Setup"
+            Get-Installer -Url $wdkUrl -OutFile $wdkSetupExe -DisplayName "WDK build 26100 Setup"
 
             $exitCode = Start-InstallerWithProgress -FilePath $wdkSetupExe `
                 -Arguments "/features + /q /norestart /ceip off" `
                 -StepName "WDK install (web installer, may take 20+ min)" `
                 -ForceConsoleProgress
-            if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-                throw "WDK installer exited with code $exitCode"
-            }
+            Assert-InstallerSuccess -ExitCode $exitCode -StepName "WDK installer"
             Write-Status "WDK installed successfully."
             if ($exitCode -eq 3010) {
                 Write-Warn "A system restart is required to complete WDK installation."
@@ -405,10 +443,11 @@ foreach ($tool in $tools) {
 
                 Write-Info "Installing $($tool.Name)..."
                 $proc = & $tool.InstallCmd $installerPath $Quiet
-                if ($proc.ExitCode -ne 0) {
-                    throw "Installer exited with code $($proc.ExitCode)"
-                }
+                Assert-InstallerSuccess -ExitCode $proc.ExitCode -StepName "$($tool.Name) installer"
                 Write-Status "$($tool.Name) installed successfully."
+                if ($proc.ExitCode -eq 3010) {
+                    Write-Warn "$($tool.Name) installation requires a system restart."
+                }
             } catch {
                 Write-Err "Failed to download/install $($tool.Name): $_"
             }
