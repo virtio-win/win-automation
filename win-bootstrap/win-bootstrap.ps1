@@ -1291,6 +1291,20 @@ function Test-ConfigTokenAllowedForUrl {
         ((Get-UrlOrigin -Url $Url) -eq $script:ConfigAuthOrigin))
 }
 
+function Resolve-ConfigRedirectTarget {
+    param(
+        [Parameter(Mandatory)] [string]$RequestUrl,
+        [Parameter(Mandatory)] [string]$Location,
+        [Parameter(Mandatory)] [bool]$TokenEligible
+    )
+
+    $nextUrl = ([Uri]::new(([Uri]$RequestUrl), $Location)).AbsoluteUri
+    if ($TokenEligible -and (Get-UrlOrigin -Url $nextUrl) -ne $script:ConfigAuthOrigin) {
+        throw "Refusing authenticated config redirect from '$RequestUrl' to a different origin."
+    }
+    return $nextUrl
+}
+
 function Get-ConfigText {
     param(
         [Parameter(Mandatory)] $Source,
@@ -1339,12 +1353,7 @@ function Get-ConfigText {
                 if ($statusCode -lt 300 -or $statusCode -ge 400) { throw }
                 $location = Get-RedirectLocation -Response $redirectResponse
                 if (-not $location) { throw "HTTP $statusCode redirect from '$requestUrl' had no Location header." }
-                $nextUrl = ([Uri]::new(([Uri]$requestUrl), $location)).AbsoluteUri
-                if ($tokenEligible -and
-                    (Get-UrlOrigin -Url $nextUrl) -ne $script:ConfigAuthOrigin) {
-                    throw "Refusing authenticated config redirect from '$requestUrl' to a different origin."
-                }
-                $requestUrl = $nextUrl
+                $requestUrl = Resolve-ConfigRedirectTarget -RequestUrl $requestUrl -Location $location -TokenEligible $tokenEligible
                 $redirectCount++
                 if ($redirectCount -gt 10) { throw "Too many redirects while fetching '$($Source.Value)'." }
                 continue
@@ -1352,12 +1361,7 @@ function Get-ConfigText {
             if ($statusCode -ge 300 -and $statusCode -lt 400) {
                 $location = Get-RedirectLocation -Response $response
                 if (-not $location) { throw "HTTP $statusCode redirect from '$requestUrl' had no Location header." }
-                $nextUrl = ([Uri]::new(([Uri]$requestUrl), $location)).AbsoluteUri
-                if ($tokenEligible -and
-                    (Get-UrlOrigin -Url $nextUrl) -ne $script:ConfigAuthOrigin) {
-                    throw "Refusing authenticated config redirect from '$requestUrl' to a different origin."
-                }
-                $requestUrl = $nextUrl
+                $requestUrl = Resolve-ConfigRedirectTarget -RequestUrl $requestUrl -Location $location -TokenEligible $tokenEligible
                 $redirectCount++
                 if ($redirectCount -gt 10) { throw "Too many redirects while fetching '$($Source.Value)'." }
                 continue
@@ -1423,12 +1427,7 @@ function Get-ConfigText {
                         if ($line -match '^Location:\s*(.+)$') { $location = $Matches[1].Trim(); break }
                     }
                     if (-not $location) { throw "HTTP $statusCode redirect from '$requestUrl' had no Location header." }
-                    $nextUrl = ([Uri]::new(([Uri]$requestUrl), $location)).AbsoluteUri
-                    if ($tokenEligible -and
-                        (Get-UrlOrigin -Url $nextUrl) -ne $script:ConfigAuthOrigin) {
-                        throw "Refusing authenticated config redirect from '$requestUrl' to a different origin."
-                    }
-                    $requestUrl = $nextUrl
+                    $requestUrl = Resolve-ConfigRedirectTarget -RequestUrl $requestUrl -Location $location -TokenEligible $tokenEligible
                     $redirectCount++
                     if ($redirectCount -gt 10) { throw "Too many redirects while fetching '$($Source.Value)'." }
                     continue
@@ -2340,6 +2339,9 @@ function Register-FirstLoginTask {
     # interactive logon, so the account it's running for can watch it
     # happen instead of wondering why software silently never appeared.
     $template = @'
+[CmdletBinding()]
+param([switch]$Quiet)
+
 $markerPath = '__MARKER_PATH__'
 if (Test-Path $markerPath) { exit }
 $logPath = '__LOG_PATH__'
@@ -2362,6 +2364,17 @@ function Test-WingetInstallSuccess {
     if ($ExitCode -eq 0) { return $true }
     $alreadyInstalledCodes = @(0x8A15002B, 0x8A150061, 0x8A15010D, 0x8A15004F)
     return $alreadyInstalledCodes -contains ($ExitCode -band 0xFFFFFFFF)
+}
+
+function Wait-ForFirstLoginAcknowledgement {
+    if ($Quiet -or -not [Environment]::UserInteractive -or $Host.Name -ne 'ConsoleHost') { return }
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            Write-Host 'Press any key to close this window...'
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        }
+    }
+    catch { }
 }
 
 # Literal copy of Resolve-DesktopShortcutSource and
@@ -2449,8 +2462,7 @@ if (-not $wingetPath) {
     Write-Host ''
     Write-Host 'winget is still not available - giving up for now.'
     Write-Host "Re-run bootstrap, or install these app(s) manually: __APP_IDS_DISPLAY__"
-    Write-Host 'Press any key to close this window...'
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    Wait-ForFirstLoginAcknowledgement
     exit 1
 }
 
@@ -2520,6 +2532,7 @@ foreach ($app in $apps) {
 if (-not $allSucceeded) {
     Write-Host ''
     Write-Host 'One or more first-login installations failed. The task and script remain for a retry; no completion marker was written.'
+    Wait-ForFirstLoginAcknowledgement
     exit 1
 }
 
@@ -2533,7 +2546,9 @@ Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
     $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__APPS__', $appsLiteral).Replace('__APP_IDS_DISPLAY__', $appIdsDisplay).Replace('__APP_COUNT__', $Apps.Count).Replace('__TASK_NAME__', $taskName)
     Set-Content -Path $scriptPath -Value $scriptContent
 
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
+    $actionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
+    if ($Quiet) { $actionArguments += ' -Quiet' }
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $actionArguments
     # A short delay reduces the odds of racing the rest of logon
     # processing, on top of the in-script retry loop above - cheap
     # insurance, though the retry loop is what actually makes this
