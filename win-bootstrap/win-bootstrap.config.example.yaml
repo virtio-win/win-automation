@@ -1,30 +1,40 @@
-# Example win-bootstrap.ps1 config. Copy this file, customize it, and either:
+# Reference example, not a ready-to-run deployment profile. It enables real
+# changes, including recovery-partition deletion and kernel debugging, and
+# contains placeholder certificates/keys that must be replaced or omitted.
+# Keep only the sections you need; example values are not script defaults.
+# Copy this file, customize it, and either:
 #   - name your copy "win-bootstrap.config.yaml" and place it next to
 #     win-bootstrap.ps1 (the default location the script looks for), or
 #   - pass its path via -ConfigPath, or
 #   - host it (e.g. in a private repo) and pass its raw URL via -ConfigUrl
 #     (set $env:BOOTSTRAP_CONFIG_TOKEN first if the host requires auth; if
 #     the URL goes through a corporate TLS-inspecting proxy, see
-#     -ConfigCaPath / -ConfigUrlInsecureSkipCertCheck in win-bootstrap.ps1's
-#     own help - `Get-Help .\win-bootstrap.ps1 -Full`).
+#     -ConfigCaPath / -ConfigCaUrl / -ConfigUrlInsecureSkipCertCheck in the
+#     script's help).
+# Full reference: ../docs/windows-bootstrap.md. Command-line help:
+#   Get-Help .\win-bootstrap.ps1 -Full
 #
 # Every section below is optional - a step with no corresponding entry is
 # simply skipped, that's expected and not an error. You could just as well
 # have a config that only sets root_ca and nothing else.
 #
-# Sections that aren't already a single boolean/enum value also accept
-# "disabled: true" to switch them off without deleting their content,
-# handy while iterating. Default false everywhere (runs as normal):
-#   - firewall / recovery_partition (map sections) - disabled: true right
-#     inside the map.
-#   - root_ca / defender_exclusions / smb_shares / local_users / apps
-#     (list sections) - disabled: true on an individual entry skips just
-#     that one; to disable the whole list at once instead, wrap it as
-#     "<key>: { disabled: true, items: [...] }" in place of a bare list -
-#     both shapes are accepted.
-# windows_terminal/ssh_server already have the whole-section effect via
-# their own "enable: false", and root_ca entries individually via
-# "install: false".
+# The following sections support "disabled: true" (default false). It
+# skips configured actions; it does not undo earlier changes:
+#   - firewall / recovery_partition / power / network: inside the map.
+#   - defender_exclusions / smb_shares / local_users / apps: on an
+#     individual list entry to skip that entry.
+#   - root_ca: use "install: false" for an individual certificate;
+#     per-entry "disabled" is NOT supported.
+# To disable a whole root_ca / defender_exclusions / smb_shares /
+# local_users / apps list, use the wrapper below instead of a bare list.
+# For apps, see the first-login limitation in its section below.
+# Example:
+#       defender_exclusions:
+#         disabled: true
+#         items:
+#           - path: C:\Devel
+# windows_terminal / ssh_server / kernel_debugging use "enable: false"
+# instead of "disabled"; this does not uninstall/disable an existing setup.
 #
 # win-bootstrap.ps1 also takes -Only <tags>/-Skip <tags> on the command
 # line (e.g. -Only ssh, or -Skip apps) to run just one feature or
@@ -32,23 +42,33 @@
 # `Get-Help .\win-bootstrap.ps1 -Full` for the full tag list.
 #
 # Before deploying a config anywhere, check it for authoring mistakes with
-# -ValidateConfig (no elevation, no machine state touched - safe to run on
-# any machine, not just the eventual target):
-#   .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml -ValidateConfig
+# -ValidateConfig (no elevation or provisioning changes):
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml -ValidateConfig
+# This checks syntax and configuration rules, not certificate/key contents,
+# secret availability, or whether a real run will succeed. Normal runs need
+# Administrator privileges. -Quiet auto-confirms risky operations and may
+# reboot automatically when configured changes require it.
+#
+# All *_url resources use BOOTSTRAP_CONFIG_TOKEN only when their URL matches
+# the configured config URL's origin (scheme/host/port). No token is sent to
+# other origins. Authenticated cross-origin redirects are rejected.
+# Do not put literal tokens in commands recorded by shell history; use your
+# secret manager or CI secret injection.
 #
 # Supported YAML subset only (see the header comment in win-bootstrap.ps1
 # for the exact parser rules): 2-space indentation, no tabs, no flow
-# mappings ({a: b}), no anchors/aliases, no multi-document files. Comments
-# start with #.
+# mappings, no anchors/aliases, no multi-document files. Comments start
+# with #. Write mappings as indented key/value lines.
 #
 # secret_manager (optional): required only if any field below uses a
 # "_secret_id" source (cert_secret_id, private_key_secret_id,
 # password_secret_id) - a secret ID in Bitwarden Secrets Manager, fetched
 # at run time via the bws CLI (installed automatically on first use, and
 # added to the machine PATH). "bws" is the only supported value today.
-# Requires $env:BWS_ACCESS_TOKEN to be set before running. Using a
-# "_secret_id" field anywhere without this set is a config error, caught
-# by -ValidateConfig above.
+# -ValidateConfig checks that secret_manager: bws is configured when a
+# _secret_id field is used. It does not check BWS_ACCESS_TOKEN or fetch a
+# secret. Set $env:BWS_ACCESS_TOKEN before a run that resolves secrets;
+# a missing token or inaccessible secret fails when the resource is read.
 # secret_manager: bws
 
 # ----------------------------------------------------------------------------
@@ -152,7 +172,7 @@ recovery_partition:
 # with a warning (no directory is created, no exclusion is added).
 #
 # disabled (optional, default false) skips just that one entry, keeping it
-# here for later - or wrap the whole list as { disabled: true, items: [...] }
+# here for later - or use the block-map form shown at the top of this file
 # to skip all of it at once (see the top-of-file note on disabled: true).
 defender_exclusions:
   - path: C:\Devel
@@ -197,7 +217,7 @@ windows_terminal:
 #   ping    - block | allow_lan | allow_all. block actively removes this
 #             script's own ping-allow firewall rule if present (Windows
 #             ships with ping disabled by default on every profile, so
-#             this just makes that explicit/idempotent); allow_lan opens
+#             this just makes that explicit); allow_lan opens
 #             ICMPv4 Echo Request for Private/Domain networks; allow_all
 #             opens it for any network including Public.
 #   smb     - same block | allow_lan | allow_all shape, for the SMB
@@ -226,13 +246,13 @@ firewall:
 # practice still requires a valid login on a workgroup machine unless
 # anonymous access is separately enabled, which is off by default) - this
 # script sets both the SMB share permission and a matching NTFS ACE on
-# path, so the effective access actually matches regardless of whatever
-# that path happened to inherit. Requires a corresponding firewall.smb
-# entry above (block | allow_lan | allow_all) to actually be reachable
-# over the network.
+# path. Other existing/inherited permissions are preserved; this is not a
+# complete ACL reset or a guarantee of each user's effective access.
+# Network access also requires suitable firewall rules; use firewall.smb
+# above to manage this script's SMB rules (allow_lan or allow_all to allow).
 #
 # disabled (optional, default false) skips just that one share, keeping it
-# here for later - or wrap the whole list as { disabled: true, items: [...] }
+# here for later - or use the block-map form shown at the top of this file
 # to skip all shares at once (see the top-of-file note on disabled: true).
 smb_shares:
   - name: Shared
@@ -248,8 +268,8 @@ smb_shares:
 #   name                    - required
 #   password                - inline plaintext password
 #   password_path           - local file containing the password
-#   password_url            - fetched (same BOOTSTRAP_CONFIG_TOKEN
-#                             bearer-token support as the config url itself)
+#   password_url            - fetched; token restricted to the config URL
+#                             origin (see the shared *_url rule above)
 #   password_secret_id      - a Bitwarden Secrets Manager secret ID (needs
 #                             secret_manager: bws above and
 #                             $env:BWS_ACCESS_TOKEN set)
@@ -276,20 +296,25 @@ smb_shares:
 #                             user to work - it needs a real session).
 #                             Result logged to
 #                             C:\ProgramData\win-bootstrap\first-login-<name>.log.
-#                             Set false to opt out.
+#                             Set false to skip scheduling; this does not
+#                             remove an already-registered task. See apps
+#                             below for first-login option limitations.
 #   disabled                - optional, default false - skip just this
-#                             entry, keeping it here for later (or wrap
-#                             the whole list as { disabled: true, items:
-#                             [...] } to skip every account at once - see
-#                             the top-of-file note on disabled: true)
+#                             entry, keeping it here for later (or use the
+#                             block-map form shown at the top of this file
+#                             to skip every account at once - see the
+#                             top-of-file note on disabled: true)
 #
 # Exactly one of password / password_path / password_url /
-# password_secret_id / generate / ask must be given.
+# password_secret_id / generate / ask must be selected. Remove the active
+# generate: true before enabling one of the commented alternatives below.
+# Likewise, replace the active inline value rather than adding a second
+# source when switching a certificate or private key to _path/_url/_secret_id.
 #
-# generate, and ask when run with -Quiet (no console to prompt on, so ask
-# falls back to generate's behavior), are the only options where a real
-# secret never has to be written into this file at all: the account is
-# forced to change its password at next interactive logon, and the
+# password_path, password_url, password_secret_id, and interactive ask all
+# avoid storing the password in this YAML. generate needs no pre-existing
+# password source; ask falls back to generation under -Quiet. With a
+# generated password, the account must change it at next logon, and the
 # generated value is revealed exactly once - printed to the console if
 # interactive, or (in -Quiet mode, since output may just scroll into an
 # unattended log) written to a locked-down file next to this script named
@@ -317,7 +342,7 @@ local_users:
     # ssh_keys: default
     # 'default' above reuses ssh_server.authorized_keys below; alternatively
     # give a list of explicit "ssh-... comment" lines and/or
-    # { key_secret_id: <id> } maps (a Bitwarden Secrets Manager secret ID -
+    # block maps with key_secret_id (a Bitwarden Secrets Manager secret ID -
     # see ssh_server.authorized_keys below for the same pattern), e.g.:
     #   ssh_keys:
     #     - "ssh-ed25519 AAAA...replace-with-your-actual-public-key... your-comment"
@@ -394,8 +419,8 @@ ssh_server:
       # private_key_secret_id: 00000000-0000-0000-0000-000000000000
   authorized_keys:
     - "ssh-ed25519 AAAA...replace-with-your-actual-public-key... your-comment"
-    # Each entry is either a literal string like above, or a
-    # { key_secret_id: <id> } map fetched from Bitwarden Secrets Manager -
+    # Each entry is either a literal string like above, or a block map with
+    # key_secret_id fetched from Bitwarden Secrets Manager -
     # handy for a shared/personal access key reused across machines
     # instead of pasting the same key text into every config:
     # - key_secret_id: 00000000-0000-0000-0000-000000000000
@@ -404,13 +429,13 @@ ssh_server:
 # root_ca
 # ----------------------------------------------------------------------------
 # Install one or more root CA certificates. Each entry needs exactly one of
-# cert (inline PEM), cert_path (local file), cert_url (fetched, same
-# BOOTSTRAP_CONFIG_TOKEN bearer-token support as the config URL itself), or
+# cert (inline PEM), cert_path (local file), cert_url (fetched, with
+# BOOTSTRAP_CONFIG_TOKEN sent only to the selected config URL origin
+# (scheme/host/port), not used to authenticate a different origin), or
 # cert_secret_id (a Bitwarden Secrets Manager secret ID - needs
 # secret_manager: bws above and $env:BWS_ACCESS_TOKEN set).
-# install: false skips just that one entry; wrap the whole list as
-# { disabled: true, items: [...] } to skip every cert at once (see the
-# top-of-file note on disabled: true).
+# install: false skips just that one entry; use the block-map form shown at
+# the top of this file to skip every cert at once (see the top-of-file note).
 root_ca:
   - name: my-corporate-root-ca
     install: true
@@ -441,7 +466,7 @@ root_ca:
 # windows_terminal above, they're special-cased.
 #
 # disabled (optional, default false) skips just that one entry, keeping it
-# here for later - or wrap the whole list as { disabled: true, items: [...] }
+# here for later - or use the block-map form shown at the top of this file
 # to skip installing every app at once (see the top-of-file note on
 # disabled: true).
 #
@@ -455,7 +480,13 @@ root_ca:
 # be deleted). Independently, each local_users account with
 # complete_setup_on_first_login gets its own copy of every scope: user
 # app installed automatically the next time THAT account logs in for
-# real - see local_users above.
+# real - see local_users above. The first-login helper receives only id and
+# desktop_shortcut: platforms, architecture, and installer_type are NOT
+# carried over. Do not rely on those options to constrain first-login installs.
+# Whole-list apps.disabled also prevents new first-login scheduling. You can
+# instead disable each relevant app entry, set complete_setup_on_first_login:
+# false for the user, or use -Skip first_login.
+# These controls do not remove tasks already registered by an earlier run.
 #
 # desktop_shortcut (optional, default false) picks a single shortcut for
 # the app and copies it to a desktop too - the shared all-users desktop
@@ -520,7 +551,7 @@ crash_dump:
 # alone, never touches BCD. A reboot is required for changes here to
 # actually take effect.
 #
-# target: current | dedicated
+# target: current | dedicated (optional, default: current)
 #   current   - enables debug on today's default boot entry, in place.
 #   dedicated - finds or creates ONE script-managed copy of it (a fixed,
 #               recognizable boot entry - never duplicated on reruns) and
@@ -549,6 +580,7 @@ crash_dump:
 # config. Note dbgsettings is a single GLOBAL BCD object shared by *any*
 # entry with debug on, not per-entry - relevant if you ever have more
 # than one debug-enabled entry at once.
+# Serial defaults: port COM1, baud_rate 115200.
 kernel_debugging:
   enable: true
   target: dedicated
@@ -561,6 +593,10 @@ kernel_debugging:
   # network:
   #   host_ip: 192.168.1.50
   #   port: 50000
+  #   # Optional PCI location of the debug NIC: bus.device.function.
+  #   # Omit to let Windows select it. Reconciled on reruns independently
+  #   # of the key, e.g. when multiple NICs require an explicit choice.
+  #   # bus_params: "2.0.0"
   #   generate: true      # or key / key_path / key_url / key_secret_id - exactly one.
   #                        # A generated key is only ever created once (like a generated
   #                        # local_users password) - shown once on the console, or written
@@ -666,14 +702,17 @@ power:
 # Permanently deletes the local account that ran this script
 # ($env:USERNAME) - useful when bootstrap runs under a temporary
 # provisioning account that shouldn't remain once a real admin account
-# exists (e.g. one set up via local_users above). This is deliberately
-# the LAST step of a real run, after the final summary is printed:
+# exists (e.g. one set up via local_users above). Deletion is deferred until
+# after the step summary; immediate network changes and a reboot may follow:
+#   - Hard refusal if this account is listed in local_users, even when
+#     its entry is disabled. This protects a persistent account on reruns.
 #   - Hard refusal, no override, if it would leave the machine with zero
 #     other enabled local Administrator accounts (checked against live
 #     machine state).
 #   - Same confirmation gate as recovery_partition.delete above - prompts
 #     for a literal YES unless -Quiet.
 #   - If the deletion itself fails (e.g. an active logon session), the
-#     script warns and recommends a reboot + re-run instead of hanging.
+#     script warns, records failure in its exit status, and recommends a
+#     reboot + re-run instead of hanging.
 # Omit/false leaves the account alone.
 # delete_bootstrap_user: true

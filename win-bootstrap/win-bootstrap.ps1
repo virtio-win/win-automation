@@ -123,7 +123,8 @@
     OK / NOT APPLIED / ERROR (or UNKNOWN if that step has no verification
     check implemented) - never makes any changes. Steps skipped by config/
     -Only/-Skip are still reported as SKIPPED, same as a normal run. Still
-    requires elevation, same as a normal run.
+    requires elevation, same as a normal run. Exits 1 when verification
+    reports NOT APPLIED or ERROR for any step; otherwise exits 0.
 
 .PARAMETER ValidateConfig
     Standalone, no-elevation config check: resolves, fetches, parses, and
@@ -172,14 +173,15 @@
     recovery_partition) take it directly inside the map. List sections
     (root_ca, defender_exclusions, smb_shares, local_users, apps) take it
     per-entry to disable just one item, or on the whole list at once by
-    wrapping it as "<key>: { disabled: true, items: [...] }" instead of a
-    bare list - both shapes are accepted. windows_terminal and ssh_server
+    replacing the bare list with a block map containing "disabled: true"
+    and an "items:" list - both shapes are accepted. windows_terminal and ssh_server
     already have the whole-section effect via their own "enable: false",
     and root_ca entries individually via "install: false".
 
 .PARAMETER Quiet
-    Non-interactive mode. Skips the confirmation prompt before removing the
-    recovery partition (auto-approved). If the script is not already running
+    Non-interactive mode. Automatically confirms risky actions, including
+    recovery-partition removal, bootstrap-user deletion, immediate network
+    changes, and a required reboot. If the script is not already running
     elevated, it exits with an error instead of prompting to relaunch.
 
 .EXAMPLE
@@ -264,17 +266,139 @@ $ProgressPreference = 'SilentlyContinue'
 # Full console transcript, independent of whatever window/session started
 # this run - useful because 'delete_bootstrap_user' can end that very
 # session partway through (see below), and a scheduled-task-driven run
-# has no visible window to read at all. Written to C:\ProgramData (not
-# any user profile) so it survives the bootstrap account itself being
-# deleted. Best-effort: some hosts don't support transcription at all,
-# and that's not worth failing the whole run over.
-try {
-    $script:TranscriptBaseDir = 'C:\ProgramData\win-bootstrap'
-    if (-not (Test-Path $script:TranscriptBaseDir)) { New-Item -ItemType Directory -Path $script:TranscriptBaseDir -Force | Out-Null }
-    $script:TranscriptPath = Join-Path $script:TranscriptBaseDir "bootstrap-run-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-    Start-Transcript -Path $script:TranscriptPath -Append | Out-Null
-} catch {
-    Write-Warning "Could not start a transcript log: $($_.Exception.Message)"
+# has no visible window to read at all. Written below the protected Windows
+# log directory, not under any user profile or the first-login artifact
+# directory, so standard users cannot pre-create or replace its parent.
+# Validation and verification deliberately do not create a persistent log:
+# they may fetch private config and resolve secrets, and neither mode needs
+# a durable transcript.
+$script:TranscriptActive = $false
+$script:TranscriptBaseDir = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'Logs\win-bootstrap'
+$script:TranscriptPath = $null
+$script:ConfigAuthOrigin = $null
+
+function Assert-NotReparsePoint {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Refusing reparse point at protected transcript path '$Path'."
+    }
+}
+
+function Set-BootstrapTranscriptAcl {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [switch]$Directory,
+        [switch]$AllowCurrentUser
+    )
+
+    Assert-NotReparsePoint -Path $Path
+
+    # Use stable SIDs rather than localized account names. Replace the whole
+    # DACL, rather than merely adding/replacing two grants: an old explicit
+    # ACE (for example Everyone:Read) would otherwise survive /grant:r.
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($existingRule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRuleSpecific($existingRule)
+    }
+
+    $systemSid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'
+    $administratorsSid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'
+    $currentUserSid = if ($AllowCurrentUser) { [System.Security.Principal.WindowsIdentity]::GetCurrent().User } else { $null }
+    $inheritanceFlags = if ($Directory) {
+        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    }
+    else {
+        [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $propagation = [System.Security.AccessControl.PropagationFlags]::None
+    $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @($systemSid, $rights, $inheritanceFlags, $propagation, $allow)
+    $administratorsRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @($administratorsSid, $rights, $inheritanceFlags, $propagation, $allow)
+    [void]$acl.AddAccessRule($systemRule)
+    [void]$acl.AddAccessRule($administratorsRule)
+    if ($currentUserSid) {
+        $currentUserRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @($currentUserSid, $rights, $inheritanceFlags, $propagation, $allow)
+        [void]$acl.AddAccessRule($currentUserRule)
+        $acl.SetOwner($currentUserSid)
+    }
+    else {
+        $acl.SetOwner($administratorsSid)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Start-BootstrapTranscript {
+    if ($script:TranscriptActive) { return }
+    try {
+        Assert-NotReparsePoint -Path $script:TranscriptBaseDir
+        if (-not (Test-Path $script:TranscriptBaseDir)) {
+            New-Item -ItemType Directory -Path $script:TranscriptBaseDir -Force | Out-Null
+        }
+        Assert-NotReparsePoint -Path $script:TranscriptBaseDir
+        Set-BootstrapTranscriptAcl -Path $script:TranscriptBaseDir -Directory
+        Get-ChildItem -Path $script:TranscriptBaseDir -Filter 'bootstrap-run-*.log' -File -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Assert-NotReparsePoint -Path $_.FullName
+                Set-BootstrapTranscriptAcl -Path $_.FullName
+            }
+        if (-not $script:TranscriptPath) {
+            $script:TranscriptPath = Join-Path $script:TranscriptBaseDir "bootstrap-run-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        }
+        Assert-NotReparsePoint -Path $script:TranscriptPath
+        Start-Transcript -Path $script:TranscriptPath -Append | Out-Null
+        $script:TranscriptActive = $true
+        try {
+            Set-BootstrapTranscriptAcl -Path $script:TranscriptPath
+        }
+        catch {
+            Stop-Transcript | Out-Null
+            $script:TranscriptActive = $false
+            throw
+        }
+    }
+    catch {
+        $script:TranscriptActive = $false
+        Write-Warning "Could not start a protected transcript log: $($_.Exception.Message)"
+    }
+}
+
+function Stop-BootstrapTranscript {
+    if (-not $script:TranscriptActive) { return }
+    try {
+        Stop-Transcript | Out-Null
+    }
+    finally {
+        $script:TranscriptActive = $false
+    }
+}
+
+function Invoke-WithoutBootstrapTranscript {
+    param([Parameter(Mandatory)] [scriptblock]$ScriptBlock)
+    $resume = $script:TranscriptActive
+    if ($resume) {
+        try {
+            Stop-BootstrapTranscript
+        }
+        catch {
+            throw 'Cannot safely display or handle secret material because the bootstrap transcript could not be stopped.'
+        }
+    }
+    try {
+        & $ScriptBlock
+    }
+    finally {
+        if ($resume) {
+            Start-BootstrapTranscript
+            if (-not $script:TranscriptActive) {
+                throw 'Bootstrap transcript could not be restarted after secret handling; refusing to continue.'
+            }
+        }
+    }
 }
 
 # ----------------------------------------------------------------------------
@@ -1104,6 +1228,83 @@ function ConvertTo-WebResponseText {
     return $Content
 }
 
+function Get-UrlOrigin {
+    param([Parameter(Mandatory)] [string]$Url)
+    try {
+        $uri = [Uri]$Url
+    }
+    catch {
+        throw "Invalid URL '$Url'."
+    }
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notin @('http', 'https')) {
+        throw "URL '$Url' must be an absolute HTTP(S) URL."
+    }
+    return '{0}://{1}:{2}' -f $uri.Scheme.ToLowerInvariant(), $uri.Host.ToLowerInvariant(), $uri.Port
+}
+
+function Get-RedirectLocation {
+    param([Parameter(Mandatory)] $Response)
+    $headersProperty = $Response.PSObject.Properties['Headers']
+    $headers = $null
+    if ($headersProperty) {
+        # Assign directly instead of through an if-expression: PS 7 header
+        # collections are enumerable, and the expression would unroll them
+        # into KeyValuePair objects before the lookup below.
+        $headers = $headersProperty.Value
+    }
+    if (-not $headers) { return $null }
+
+    # Windows PowerShell exposes WebHeaderCollection as an indexable map;
+    # PowerShell 7 may expose HttpResponseHeaders, where GetValues/Location
+    # is the portable access path. Keep all forms here so redirect handling
+    # remains identical across both runtimes.
+    try {
+        $indexedLocation = $headers['Location']
+        if ($indexedLocation) { return [string]$indexedLocation }
+    }
+    catch { }
+    $locationProperty = $headers.PSObject.Properties['Location']
+    if ($locationProperty -and $locationProperty.Value) {
+        return [string]$locationProperty.Value
+    }
+    try {
+        $values = @($headers.GetValues('Location'))
+        if ($values.Count -gt 0) { return [string]$values[0] }
+    }
+    catch { }
+    try {
+        $headerText = $headers.ToString()
+        if ($headerText -match '(?im)(?:^|\r?\n)Location:\s*([^\r\n]+)') {
+            return $Matches[1].Trim()
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Test-ConfigTokenAllowedForUrl {
+    param([Parameter(Mandatory)] [string]$Url)
+    if ($env:BOOTSTRAP_CONFIG_TOKEN -and $env:BOOTSTRAP_CONFIG_TOKEN -match '[\r\n]') {
+        throw 'BOOTSTRAP_CONFIG_TOKEN must not contain CR or LF characters.'
+    }
+    return [bool]($env:BOOTSTRAP_CONFIG_TOKEN -and $script:ConfigAuthOrigin -and
+        ((Get-UrlOrigin -Url $Url) -eq $script:ConfigAuthOrigin))
+}
+
+function Resolve-ConfigRedirectTarget {
+    param(
+        [Parameter(Mandatory)] [string]$RequestUrl,
+        [Parameter(Mandatory)] [string]$Location,
+        [Parameter(Mandatory)] [bool]$TokenEligible
+    )
+
+    $nextUrl = ([Uri]::new(([Uri]$RequestUrl), $Location)).AbsoluteUri
+    if ($TokenEligible -and (Get-UrlOrigin -Url $nextUrl) -ne $script:ConfigAuthOrigin) {
+        throw "Refusing authenticated config redirect from '$RequestUrl' to a different origin."
+    }
+    return $nextUrl
+}
+
 function Get-ConfigText {
     param(
         [Parameter(Mandatory)] $Source,
@@ -1117,14 +1318,57 @@ function Get-ConfigText {
         return Get-Content -Path $Source.Value -Raw
     }
 
-    $headers = @{}
-    if ($env:BOOTSTRAP_CONFIG_TOKEN) {
-        $headers['Authorization'] = "Bearer $($env:BOOTSTRAP_CONFIG_TOKEN)"
-    }
-
+    $requestUrl = [string]$Source.Value
+    $redirectCount = 0
+    $tokenEligible = Test-ConfigTokenAllowedForUrl -Url $requestUrl
     if (-not $SkipCertCheck) {
-        $response = Invoke-WebRequest -Uri $Source.Value -Headers $headers -UseBasicParsing
-        return ConvertTo-WebResponseText -Content $response.Content
+        while ($true) {
+            $headers = @{}
+            if ($tokenEligible -and (Get-UrlOrigin -Url $requestUrl) -eq $script:ConfigAuthOrigin) {
+                $headers['Authorization'] = "Bearer $($env:BOOTSTRAP_CONFIG_TOKEN)"
+            }
+            try {
+                # Disable automatic redirects so a bearer token can never be
+                # copied to a different origin by the HTTP stack.
+                # PS 5.1 emits the 3xx response plus a non-terminating
+                # maximum-redirection error. Promoting that error to Stop
+                # loses the response (including Location).
+                $requestErrors = @()
+                $response = Invoke-WebRequest -Uri $requestUrl -Headers $headers -UseBasicParsing -MaximumRedirection 0 -ErrorAction SilentlyContinue -ErrorVariable requestErrors
+                if (-not $response) {
+                    if ($requestErrors.Count -gt 0) { throw $requestErrors[0] }
+                    throw "No HTTP response while fetching '$requestUrl'."
+                }
+                $statusCode = [int]$response.StatusCode
+            }
+            catch {
+                # WebException has Response; ordinary command/binding errors
+                # do not. Inspect the property safely so the original error
+                # is preserved instead of being replaced by a StrictMode
+                # "property Response was not found" failure.
+                $responseProperty = $_.Exception.PSObject.Properties['Response']
+                $redirectResponse = if ($responseProperty) { $responseProperty.Value } else { $null }
+                if (-not $redirectResponse) { throw }
+                $statusCode = [int]$redirectResponse.StatusCode
+                if ($statusCode -lt 300 -or $statusCode -ge 400) { throw }
+                $location = Get-RedirectLocation -Response $redirectResponse
+                if (-not $location) { throw "HTTP $statusCode redirect from '$requestUrl' had no Location header." }
+                $requestUrl = Resolve-ConfigRedirectTarget -RequestUrl $requestUrl -Location $location -TokenEligible $tokenEligible
+                $redirectCount++
+                if ($redirectCount -gt 10) { throw "Too many redirects while fetching '$($Source.Value)'." }
+                continue
+            }
+            if ($statusCode -ge 300 -and $statusCode -lt 400) {
+                $location = Get-RedirectLocation -Response $response
+                if (-not $location) { throw "HTTP $statusCode redirect from '$requestUrl' had no Location header." }
+                $requestUrl = Resolve-ConfigRedirectTarget -RequestUrl $requestUrl -Location $location -TokenEligible $tokenEligible
+                $redirectCount++
+                if ($redirectCount -gt 10) { throw "Too many redirects while fetching '$($Source.Value)'." }
+                continue
+            }
+            if ($statusCode -ge 400) { throw "HTTP $statusCode fetching '$requestUrl'." }
+            return ConvertTo-WebResponseText -Content $response.Content
+        }
     }
 
     Write-Warning "TLS certificate validation was skipped for the config URL fetch ($($Source.Value)) - only safe if you already trust this URL's destination by other means, e.g. an internal server you control."
@@ -1143,22 +1387,61 @@ function Get-ConfigText {
         throw 'curl.exe not found - required for -ConfigUrlInsecureSkipCertCheck (bundled with Windows 10 1803+/Server 2019+; if genuinely missing, use -ConfigCaPath/-ConfigCaUrl instead).'
     }
 
-    $curlArgs = @('-k', '-sS', '-L', $Source.Value)
-    foreach ($name in $headers.Keys) {
-        $curlArgs += @('-H', "${name}: $($headers[$name])")
-    }
-
-    $tempFile = Join-Path $env:TEMP "bootstrap-config-$([guid]::NewGuid().ToString('N')).tmp"
-    try {
-        & curl.exe @curlArgs -o $tempFile
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl.exe exited with code $LASTEXITCODE fetching '$($Source.Value)' (insecure/skip-cert-check mode)."
+    # Do not use curl's -L here: curl would replay -H Authorization on every
+    # redirected host. A temporary header file keeps the bearer token out of
+    # curl's process arguments; it is protected and removed in the same
+    # transcript-free block as the fetch.
+    $initialUrl = $requestUrl
+    $result = Invoke-WithoutBootstrapTranscript {
+        $tempFile = Join-Path $env:TEMP "bootstrap-config-$([guid]::NewGuid().ToString('N')).tmp"
+        $headerFile = Join-Path $env:TEMP "bootstrap-config-header-$([guid]::NewGuid().ToString('N')).tmp"
+        $responseHeadersFile = Join-Path $env:TEMP "bootstrap-config-response-$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            $requestUrl = $initialUrl
+            $redirectCount = 0
+            while ($true) {
+                # -q must be curl's first argument: it prevents loading a
+                # user-controlled .curlrc/_curlrc which could otherwise
+                # redirect this -k request and receive its bearer token.
+                $curlArgs = @('-q', '-k', '-sS', '-D', $responseHeadersFile, '-o', $tempFile, '-w', '%{http_code}', $requestUrl)
+                if ($tokenEligible -and (Get-UrlOrigin -Url $requestUrl) -eq $script:ConfigAuthOrigin) {
+                    if (-not (Test-Path $headerFile)) {
+                        New-Item -ItemType File -Path $headerFile -Force | Out-Null
+                        Set-BootstrapTranscriptAcl -Path $headerFile -AllowCurrentUser
+                    }
+                    Set-Content -Path $headerFile -Value "Authorization: Bearer $($env:BOOTSTRAP_CONFIG_TOKEN)" -NoNewline -Encoding ascii
+                    $curlArgs += @('-H', "@$headerFile")
+                }
+                $statusText = & curl.exe @curlArgs
+                if ($LASTEXITCODE -ne 0) {
+                    throw "curl.exe exited with code $LASTEXITCODE fetching '$requestUrl' (insecure/skip-cert-check mode)."
+                }
+                $statusCode = 0
+                if (-not [int]::TryParse(([string]$statusText).Trim(), [ref]$statusCode)) {
+                    throw "curl.exe did not return an HTTP status while fetching '$requestUrl'."
+                }
+                if ($statusCode -ge 300 -and $statusCode -lt 400) {
+                    $location = $null
+                    $headersText = @(Get-Content -Path $responseHeadersFile -ErrorAction SilentlyContinue)
+                    foreach ($line in $headersText) {
+                        if ($line -match '^Location:\s*(.+)$') { $location = $Matches[1].Trim(); break }
+                    }
+                    if (-not $location) { throw "HTTP $statusCode redirect from '$requestUrl' had no Location header." }
+                    $requestUrl = Resolve-ConfigRedirectTarget -RequestUrl $requestUrl -Location $location -TokenEligible $tokenEligible
+                    $redirectCount++
+                    if ($redirectCount -gt 10) { throw "Too many redirects while fetching '$($Source.Value)'." }
+                    continue
+                }
+                if ($statusCode -ge 400) { throw "HTTP $statusCode fetching '$requestUrl'." }
+                Get-Content -Path $tempFile -Raw
+                break
+            }
         }
-        return Get-Content -Path $tempFile -Raw
+        finally {
+            Remove-Item -Path $tempFile, $headerFile, $responseHeadersFile -Force -ErrorAction SilentlyContinue
+        }
     }
-    finally {
-        Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
-    }
+    return $result
 }
 
 # Shared by the normal/-Verify flow (section 3 below, after the CA
@@ -1175,6 +1458,9 @@ function Get-BootstrapConfigSourceText {
         [switch]$Quiet
     )
     $configSource = Resolve-ConfigSource -ConfigPath $ConfigPath -ConfigUrl $ConfigUrl
+    if ($configSource.Kind -eq 'Url') {
+        $script:ConfigAuthOrigin = Get-UrlOrigin -Url $configSource.Value
+    }
     Write-Host "Using config from $($configSource.Kind): $($configSource.Value)" -ForegroundColor Cyan
     $configText = Get-ConfigText -Source $configSource -SkipCertCheck:$ConfigUrlInsecureSkipCertCheck
     if ([string]::IsNullOrWhiteSpace($configText)) {
@@ -2053,6 +2339,9 @@ function Register-FirstLoginTask {
     # interactive logon, so the account it's running for can watch it
     # happen instead of wondering why software silently never appeared.
     $template = @'
+[CmdletBinding()]
+param([switch]$Quiet)
+
 $markerPath = '__MARKER_PATH__'
 if (Test-Path $markerPath) { exit }
 $logPath = '__LOG_PATH__'
@@ -2068,6 +2357,24 @@ function Resolve-WingetPath {
     $candidate = Join-Path $pkg.InstallLocation 'winget.exe'
     if (Test-Path $candidate) { return $candidate }
     return $null
+}
+
+function Test-WingetInstallSuccess {
+    param([Parameter(Mandatory)] [int]$ExitCode)
+    if ($ExitCode -eq 0) { return $true }
+    $alreadyInstalledCodes = @(0x8A15002B, 0x8A150061, 0x8A15010D, 0x8A15004F)
+    return $alreadyInstalledCodes -contains ($ExitCode -band 0xFFFFFFFF)
+}
+
+function Wait-ForFirstLoginAcknowledgement {
+    if ($Quiet -or -not [Environment]::UserInteractive -or $Host.Name -ne 'ConsoleHost') { return }
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            Write-Host 'Press any key to close this window...'
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        }
+    }
+    catch { }
 }
 
 # Literal copy of Resolve-DesktopShortcutSource and
@@ -2155,11 +2462,11 @@ if (-not $wingetPath) {
     Write-Host ''
     Write-Host 'winget is still not available - giving up for now.'
     Write-Host "Re-run bootstrap, or install these app(s) manually: __APP_IDS_DISPLAY__"
-    Write-Host 'Press any key to close this window...'
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    Wait-ForFirstLoginAcknowledgement
     exit 1
 }
 
+$allSucceeded = $true
 foreach ($app in $apps) {
     $id = $app.Id
     Write-Host "Installing $id ..."
@@ -2190,6 +2497,12 @@ foreach ($app in $apps) {
 
         & $wingetPath install --scope user --id $id --source winget --accept-package-agreements --accept-source-agreements --silent
         $exitCode = $LASTEXITCODE
+        if (-not (Test-WingetInstallSuccess -ExitCode $exitCode)) {
+            $allSucceeded = $false
+            "$(Get-Date -Format o) - $id - FAILED exit $exitCode" | Out-File -FilePath $logPath -Append
+            Write-Host "  FAILED: winget exited with code $exitCode"
+            continue
+        }
 
         if ($app.DesktopShortcut -and (Test-Path $userStartMenu)) {
             $resolved = Resolve-DesktopShortcutSourceWithRetry -DesktopBefore $desktopBefore -DesktopPath $userDesktop -StartMenuBefore $startMenuBefore -StartMenuPath $userStartMenu
@@ -2210,9 +2523,17 @@ foreach ($app in $apps) {
         "$(Get-Date -Format o) - $id - exit $exitCode" | Out-File -FilePath $logPath -Append
         Write-Host "  done (exit $exitCode)"
     } catch {
+        $allSucceeded = $false
         "$(Get-Date -Format o) - $id - ERROR: $($_.Exception.Message)" | Out-File -FilePath $logPath -Append
         Write-Host "  FAILED: $($_.Exception.Message)"
     }
+}
+
+if (-not $allSucceeded) {
+    Write-Host ''
+    Write-Host 'One or more first-login installations failed. The task and script remain for a retry; no completion marker was written.'
+    Wait-ForFirstLoginAcknowledgement
+    exit 1
 }
 
 New-Item -ItemType File -Path $markerPath -Force | Out-Null
@@ -2225,7 +2546,9 @@ Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
     $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__APPS__', $appsLiteral).Replace('__APP_IDS_DISPLAY__', $appIdsDisplay).Replace('__APP_COUNT__', $Apps.Count).Replace('__TASK_NAME__', $taskName)
     Set-Content -Path $scriptPath -Value $scriptContent
 
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
+    $actionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
+    if ($Quiet) { $actionArguments += ' -Quiet' }
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $actionArguments
     # A short delay reduces the odds of racing the rest of logon
     # processing, on top of the in-script retry loop above - cheap
     # insurance, though the retry loop is what actually makes this
@@ -2504,6 +2827,13 @@ if (-not (Test-IsAdmin)) {
     exit 0
 }
 
+# The protected transcript directory requires elevation. Starting it only
+# after this gate prevents a non-admin parent process from producing a
+# misleading access-denied warning before it relaunches elevated.
+if (-not $ValidateConfig -and -not $Verify) {
+    Start-BootstrapTranscript
+}
+
 # ----------------------------------------------------------------------------
 # 2. Architecture detection
 # ----------------------------------------------------------------------------
@@ -2526,6 +2856,10 @@ Write-Host "Detected architecture: $Arch" -ForegroundColor Cyan
 # and is validated normally, same as any other HTTPS call this script makes.
 $configCaPath = if ($ConfigCaPath) { $ConfigCaPath } else { $env:BOOTSTRAP_CONFIG_CA_PATH }
 $configCaUrl = if ($ConfigCaUrl) { $ConfigCaUrl } else { $env:BOOTSTRAP_CONFIG_CA_URL }
+$configUrlForAuth = if ($ConfigUrl) { $ConfigUrl } else { $env:BOOTSTRAP_CONFIG_URL }
+if ($configUrlForAuth) {
+    $script:ConfigAuthOrigin = Get-UrlOrigin -Url $configUrlForAuth
+}
 if ($configCaPath -and $configCaUrl) {
     throw '-ConfigCaPath and -ConfigCaUrl (and their environment variable equivalents) are mutually exclusive; specify only one.'
 }
@@ -2722,22 +3056,26 @@ else {
                         # go to an unattended log) - drop it in a file next to the script
                         # instead, locked down the same way ssh host keys are, so it
                         # survives for the operator to read, change, then delete.
-                        $dumpPath = Join-Path $PSScriptRoot "$userName.generated-password.txt"
-                        Set-Content -Path $dumpPath -Value $plainPassword -NoNewline -Encoding ascii
-                        icacls.exe $dumpPath /inheritance:r | Out-Null
-                        if ($LASTEXITCODE -ne 0) { throw "icacls /inheritance:r failed (exit $LASTEXITCODE) for $dumpPath" }
-                        icacls.exe $dumpPath /grant 'SYSTEM:F' | Out-Null
-                        if ($LASTEXITCODE -ne 0) { throw "icacls /grant SYSTEM:F failed (exit $LASTEXITCODE) for $dumpPath" }
-                        icacls.exe $dumpPath /grant 'Administrators:F' | Out-Null
-                        if ($LASTEXITCODE -ne 0) { throw "icacls /grant Administrators:F failed (exit $LASTEXITCODE) for $dumpPath" }
-                        Write-Warning "Generated password for '$userName' written to '$dumpPath' - read it, change the password, then delete this file."
+                        Invoke-WithoutBootstrapTranscript {
+                            $dumpPath = Join-Path $PSScriptRoot "$userName.generated-password.txt"
+                            Set-Content -Path $dumpPath -Value $plainPassword -NoNewline -Encoding ascii
+                            icacls.exe $dumpPath /inheritance:r | Out-Null
+                            if ($LASTEXITCODE -ne 0) { throw "icacls /inheritance:r failed (exit $LASTEXITCODE) for $dumpPath" }
+                            icacls.exe $dumpPath /grant 'SYSTEM:F' | Out-Null
+                            if ($LASTEXITCODE -ne 0) { throw "icacls /grant SYSTEM:F failed (exit $LASTEXITCODE) for $dumpPath" }
+                            icacls.exe $dumpPath /grant 'Administrators:F' | Out-Null
+                            if ($LASTEXITCODE -ne 0) { throw "icacls /grant Administrators:F failed (exit $LASTEXITCODE) for $dumpPath" }
+                            Write-Warning "Generated password for '$userName' written to '$dumpPath' - read it, change the password, then delete this file."
+                        }
                     }
                     else {
-                        Write-Host '================================================================'
-                        Write-Host "GENERATED PASSWORD for '$userName' (save now - shown only once):"
-                        Write-Host "  $plainPassword"
-                        Write-Host 'Must be changed at next interactive logon.'
-                        Write-Host '================================================================'
+                        Invoke-WithoutBootstrapTranscript {
+                            Write-Host '================================================================'
+                            Write-Host "GENERATED PASSWORD for '$userName' (save now - shown only once):"
+                            Write-Host "  $plainPassword"
+                            Write-Host 'Must be changed at next interactive logon.'
+                            Write-Host '================================================================'
+                        }
                     }
                 }
             }
@@ -4367,14 +4705,19 @@ else {
         $userName = Get-ConfigValue $entry @('name')
         $userDisabled = Get-ConfigValue $entry @('disabled') $false
         $completeSetupOnFirstLogin = Get-ConfigValue $entry @('complete_setup_on_first_login') $true
-        $userScopeAppsForLogin = @($apps | Where-Object {
-            (Get-ConfigValue $_ @('scope') 'machine') -eq 'user' -and -not (Get-ConfigValue $_ @('disabled') $false)
-        } | ForEach-Object {
-            [pscustomobject]@{
-                Id              = Get-ConfigValue $_ @('id')
-                DesktopShortcut = Get-ConfigValue $_ @('desktop_shortcut') $false
-            }
-        })
+        $userScopeAppsForLogin = if ($appsDisabled) {
+            @()
+        }
+        else {
+            @($apps | Where-Object {
+                (Get-ConfigValue $_ @('scope') 'machine') -eq 'user' -and -not (Get-ConfigValue $_ @('disabled') $false)
+            } | ForEach-Object {
+                [pscustomobject]@{
+                    Id              = Get-ConfigValue $_ @('id')
+                    DesktopShortcut = Get-ConfigValue $_ @('desktop_shortcut') $false
+                }
+            })
+        }
 
         $firstLoginSkip = if ($localUsersDisabled) {
             "'local_users.disabled' is set to true"
@@ -4382,6 +4725,8 @@ else {
             "'disabled: true' for user '$userName'"
         } elseif (-not $completeSetupOnFirstLogin) {
             "'complete_setup_on_first_login: false' for user '$userName'"
+        } elseif ($appsDisabled) {
+            "'apps.disabled' is set to true"
         } elseif ($userScopeAppsForLogin.Count -eq 0) {
             "no 'scope: user' apps configured"
         } else { $null }
@@ -4673,20 +5018,24 @@ Invoke-Step -Name 'Configure kernel debugger transport' -SkipReason $kernelDebug
             # passwords - console if interactive, locked-down file next to
             # the script under -Quiet.
             if ($Quiet) {
-                $dumpPath = Join-Path $PSScriptRoot 'kernel-debug-key.generated.txt'
-                Set-Content -Path $dumpPath -Value $revealKey -NoNewline -Encoding ascii
-                icacls.exe $dumpPath /inheritance:r | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "icacls /inheritance:r failed (exit $LASTEXITCODE) for $dumpPath" }
-                icacls.exe $dumpPath /grant 'SYSTEM:F' | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "icacls /grant SYSTEM:F failed (exit $LASTEXITCODE) for $dumpPath" }
-                icacls.exe $dumpPath /grant 'Administrators:F' | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "icacls /grant Administrators:F failed (exit $LASTEXITCODE) for $dumpPath" }
-                Write-Warning "Generated kernel debug key written to '$dumpPath' - read it, then delete this file."
+                Invoke-WithoutBootstrapTranscript {
+                    $dumpPath = Join-Path $PSScriptRoot 'kernel-debug-key.generated.txt'
+                    Set-Content -Path $dumpPath -Value $revealKey -NoNewline -Encoding ascii
+                    icacls.exe $dumpPath /inheritance:r | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "icacls /inheritance:r failed (exit $LASTEXITCODE) for $dumpPath" }
+                    icacls.exe $dumpPath /grant 'SYSTEM:F' | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "icacls /grant SYSTEM:F failed (exit $LASTEXITCODE) for $dumpPath" }
+                    icacls.exe $dumpPath /grant 'Administrators:F' | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "icacls /grant Administrators:F failed (exit $LASTEXITCODE) for $dumpPath" }
+                    Write-Warning "Generated kernel debug key written to '$dumpPath' - read it, then delete this file."
+                }
             }
             else {
-                Write-Host '================================================================'
-                Write-Host "GENERATED KERNEL DEBUG KEY (save now - shown only once): $revealKey"
-                Write-Host '================================================================'
+                Invoke-WithoutBootstrapTranscript {
+                    Write-Host '================================================================'
+                    Write-Host "GENERATED KERNEL DEBUG KEY (save now - shown only once): $revealKey"
+                    Write-Host '================================================================'
+                }
             }
         }
     }
@@ -5247,16 +5596,23 @@ if ($script:VerifyMode) {
     if ($errors.Count -gt 0) {
         Write-Warning "$($errors.Count) step(s) could not be verified due to an error. Review the summary above."
     }
-    Write-Host 'Verification complete. No changes were made to this machine.' -ForegroundColor Green
+    $script:BootstrapExitCode = if ($notApplied.Count -gt 0 -or $errors.Count -gt 0) { 1 } else { 0 }
+    if ($script:BootstrapExitCode -eq 0) {
+        Write-Host 'Verification complete. No changes were made to this machine.' -ForegroundColor Green
+    }
+    else {
+        Write-Warning 'Verification completed with mismatches or errors. No changes were made to this machine; the process will return a nonzero exit code.'
+    }
 }
 else {
     Write-Host "`n=== Bootstrap summary ===" -ForegroundColor Cyan
     $script:StepResults | Format-Table -AutoSize
 
-    $failures = @($script:StepResults | Where-Object { $_.Status -eq 'FAILED' })
+    $failures = @($script:StepResults | Where-Object { $_.Status -in @('FAILED', 'ERROR', 'NOT APPLIED') })
     if ($failures.Count -gt 0) {
-        Write-Warning "$($failures.Count) step(s) failed. Review the summary above."
+        Write-Warning "$($failures.Count) step(s) failed, errored, or were not applied. Review the summary above."
     }
+    $script:BootstrapExitCode = if ($failures.Count -gt 0) { 1 } else { 0 }
 
     if ($script:RebootRequired) {
         Write-Warning 'A reboot is required for some of the changes above to fully take effect.'
@@ -5267,10 +5623,14 @@ else {
     # Request-SshdRestart/Invoke-SshdRestart above for why restarting sshd
     # any earlier can abort the rest of this very run.
     if ($script:SshdRestartNeeded) {
-        Invoke-SshdRestart
+        try {
+            Invoke-SshdRestart
+        }
+        catch {
+            $script:BootstrapExitCode = 1
+            Write-Warning "Deferred sshd restart failed: $($_.Exception.Message)"
+        }
     }
-
-    Write-Host 'Bootstrap complete. Run this script again at any time to verify everything is still correctly applied (already-satisfied steps report OK without making changes), or use -Verify for a read-only check that never makes changes.' -ForegroundColor Green
 
     # Truly the last action in the script - see "Delete bootstrap user
     # account" above for why (the account/session running this script may
@@ -5292,6 +5652,7 @@ else {
                 Register-ProfileCleanupTask -UserName $script:BootstrapUserToDelete -Sid $bootstrapUserSid
             }
             catch {
+                $script:BootstrapExitCode = 1
                 Write-Warning "Could not schedule profile cleanup for '$script:BootstrapUserToDelete': $($_.Exception.Message)"
             }
         }
@@ -5301,6 +5662,7 @@ else {
             Write-Host "Deleted user account '$script:BootstrapUserToDelete'."
         }
         catch {
+            $script:BootstrapExitCode = 1
             Write-Warning "Could not delete user account '$script:BootstrapUserToDelete' (it may have an active logon session): $($_.Exception.Message). Reboot and re-run this script (it's idempotent) to complete the cleanup."
         }
     }
@@ -5315,6 +5677,7 @@ else {
             Set-NetworkConfiguration -InterfaceAlias $script:NetworkConfigToApplyNow.InterfaceAlias -Ip $script:NetworkConfigToApplyNow.Ip -Gateway $script:NetworkConfigToApplyNow.Gateway -Dns $script:NetworkConfigToApplyNow.Dns
         }
         catch {
+            $script:BootstrapExitCode = 1
             Write-Warning "Failed to apply network configuration: $($_.Exception.Message)"
         }
     }
@@ -5336,4 +5699,15 @@ else {
             Write-Host 'Reboot skipped - remember to reboot manually later to apply the pending change(s).'
         }
     }
+
+    if ($script:BootstrapExitCode -eq 0) {
+        Write-Host 'Bootstrap complete. Run this script again at any time to verify everything is still correctly applied (already-satisfied steps report OK without making changes), or use -Verify for a read-only check that never makes changes.' -ForegroundColor Green
+    }
+    else {
+        Write-Warning 'Bootstrap completed with one or more failures. Review the summary and warnings above; the process will return a nonzero exit code.'
+    }
 }
+
+# Keep the process status meaningful to win-bootstrap.cmd, scheduled callers,
+# and other automation even though every independent step was allowed to run.
+exit $script:BootstrapExitCode
