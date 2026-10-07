@@ -106,6 +106,7 @@ The private config token and `BWS_ACCESS_TOKEN` are independent: the first autho
   - [`remove_outlook`](#remove_outlook) — uninstall Outlook (new)
   - [`defender_exclusions`](#defender_exclusions) — Windows Defender path exclusions
   - [`uac_level`](#uac_level) — set the User Account Control level
+  - [`privacy`](#privacy) — apply the strict Windows client privacy baseline
   - [`apps`](#apps) — install apps via winget
   - [`install_powershell7`](#install_powershell7) — install PowerShell 7, native MSI build
   - [`windows_terminal`](#windows_terminal) — install Windows Terminal, set default profile
@@ -196,6 +197,14 @@ Every capability below is opt-in via its config key, and can also be selectively
   defined levels (off, never notify, default, always notify).
   - Tag: `uac`
   - Config: [`uac_level`](#uac_level)
+- **Apply strict Windows privacy policy** — an opt-in Windows 10/11
+  Pro/Enterprise/Education device-policy baseline. It suppresses the
+  first-login privacy experience, denies Windows-app privacy capabilities,
+  disables location, advertising ID, activity/cloud sharing and consumer
+  content, and limits diagnostics to Required data. It reports a clear skip
+  on Windows Server and unsupported client editions.
+  - Tag: `privacy`
+  - Config: [`privacy`](#privacy)
 - **Install apps via winget** — installs any number of packages by
   winget ID.
   - Tag: `apps`
@@ -329,6 +338,7 @@ Matching is case-insensitive.
 | `outlook` | [`remove_outlook`](#remove_outlook) |
 | `defender` | [`defender_exclusions`](#defender_exclusions) |
 | `uac` | [`uac_level`](#uac_level) |
+| `privacy` | [`privacy`](#privacy) |
 | `apps` | [`apps`](#apps) |
 | `powershell7` | [`install_powershell7`](#install_powershell7) |
 | `windows_terminal` | [`windows_terminal`](#windows_terminal) |
@@ -571,6 +581,32 @@ Sets User Account Control to one of Windows' own defined levels. Not configured 
 The rarely-used "notify without dimming the desktop" slider position isn't exposed as a separate value - it's cosmetically different from `default` only.
 
 Switching to or away from `off` only takes effect after a reboot; `-Verify` reflects the configured registry state, not live in-session UAC behavior.
+
+### `privacy`
+
+```yaml
+privacy: strict
+```
+
+`strict` is an opt-in, machine-wide privacy baseline for Windows 10 1809 or
+newer and Windows 11 client editions Pro, Enterprise, and Education. It is
+not supported on Windows Server, Windows Home, or older client releases; the
+step is reported as not applicable and makes no policy changes on those
+systems.
+
+The baseline uses documented Group Policy registry mappings. It suppresses the
+privacy experience for newly created users, disables location, advertising ID,
+online speech personalization, consumer content, activity/cloud sharing, and
+forces denial of the documented App Privacy capabilities. Diagnostic data is
+limited to **Required**, rather than claiming that Windows 11 Pro can disable
+all diagnostics. It also limits diagnostic log and dump collection and removes
+the diagnostic-data opt-in UI.
+
+This is intentionally not a generic registry-writing feature. It affects all
+local users and can disable camera, microphone, Store-app notifications, and
+other app features. Use it only for an isolated lab target where that is the
+intended policy. It does not disable networking, RDP, Windows Update, Windows
+activation, or Windows Defender.
 
 ### `apps`
 

@@ -154,7 +154,7 @@
     recovery_partition, vbs, onedrive, teams, outlook, defender, uac, apps,
     powershell7, windows_terminal, ssh, winssh_agent, computer_name,
     firewall, smb, local_users, first_login, sudo, crash_dump,
-    kernel_debugging, cleanup, product_key, power. Matching is
+    kernel_debugging, cleanup, product_key, power, network, privacy. Matching is
     case-insensitive.
 
     If ssh_server.default_shell/windows_terminal.default_profile: pwsh7 is
@@ -412,7 +412,7 @@ $script:KnownStepTags = @(
     'teams', 'outlook', 'defender', 'uac', 'apps', 'powershell7',
     'windows_terminal', 'ssh', 'winssh_agent', 'computer_name', 'firewall',
     'smb', 'local_users', 'first_login', 'sudo', 'crash_dump',
-    'kernel_debugging', 'cleanup', 'product_key', 'power', 'network'
+    'kernel_debugging', 'cleanup', 'product_key', 'power', 'network', 'privacy'
 )
 
 # A comma-separated -Only/-Skip value (e.g. "ssh,computer_name") only gets
@@ -505,6 +505,7 @@ $script:ValidKernelDebugTransports = @('serial', 'network')
 $script:ValidAppScopes = @('machine', 'user')
 $script:ValidArchitectures = @('arm64', 'x64')
 $script:ValidSecretManagers = @('bws')
+$script:ValidPrivacyModes = @('strict')
 
 # ----------------------------------------------------------------------------
 # Minimal YAML parser - only supports the subset described in the header
@@ -1024,6 +1025,12 @@ function Test-BootstrapConfig {
     $uacLevel = Get-ConfigValue $Config @('uac_level')
     if ($uacLevel -and $uacLevel -notin $script:ValidUacLevels) {
         $problems.Add("uac_level '$uacLevel' is invalid - must be one of: $($script:ValidUacLevels -join ', ').")
+    }
+
+    # privacy
+    $privacyMode = Get-ConfigValue $Config @('privacy')
+    if ($privacyMode -and $privacyMode -notin $script:ValidPrivacyModes) {
+        $problems.Add("privacy '$privacyMode' is invalid - must be one of: $($script:ValidPrivacyModes -join ', ').")
     }
 
     # power
@@ -3387,7 +3394,133 @@ Invoke-Step -Name 'Disable Virtualization-Based Security (Core Isolation)' -Skip
 }
 
 # ----------------------------------------------------------------------------
-# 9. Remove OneDrive
+# 9. Apply strict Windows privacy policy
+# ----------------------------------------------------------------------------
+
+# This is intentionally a named, reviewed baseline rather than a generic
+# registry-writer. Every setting below is a documented device policy. The
+# step detects the client policy baseline first and reports a clear skip on a
+# system where it is not applicable; it never writes speculative values to a
+# Server or unsupported Windows edition just to make verification look green.
+function Get-StrictPrivacyPolicyValues {
+    return @{
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' = @{
+            'DisablePrivacyExperience' = 1
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors' = @{
+            'DisableLocation' = 1
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' = @{
+            'AllowInputPersonalization' = 0
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo' = @{
+            'DisabledByGroupPolicy' = 1
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' = @{
+            # Windows 11 Pro supports Required diagnostic data as its
+            # minimum.  Security/0 is Enterprise/Education-only and must
+            # not be falsely promised for an ordinary Pro developer VM.
+            'AllowTelemetry' = 1
+            'DisableTelemetryOptInSettingsUx' = 1
+            'LimitDiagnosticLogCollection' = 1
+            'LimitDumpCollection' = 1
+            'DoNotShowFeedbackNotifications' = 1
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' = @{
+            'AllowCrossDeviceClipboard' = 0
+            'EnableActivityFeed' = 0
+            'PublishUserActivities' = 0
+            'UploadUserActivities' = 0
+            'EnableCdp' = 0
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' = @{
+            'DisableWindowsConsumerFeatures' = 1
+        }
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' = @{
+            # 2 is the documented Force Deny value for each App Privacy
+            # policy.  These are device policies and therefore cover the
+            # dynamically-created target user as well as the builder user.
+            'LetAppsAccessAccountInfo' = 2
+            'LetAppsAccessCalendar' = 2
+            'LetAppsAccessCallHistory' = 2
+            'LetAppsAccessCamera' = 2
+            'LetAppsAccessContacts' = 2
+            'LetAppsAccessEmail' = 2
+            'LetAppsAccessLocation' = 2
+            'LetAppsAccessMessaging' = 2
+            'LetAppsAccessMicrophone' = 2
+            'LetAppsAccessMotion' = 2
+            'LetAppsAccessNotifications' = 2
+            'LetAppsAccessPhone' = 2
+            'LetAppsAccessRadios' = 2
+            'LetAppsAccessTasks' = 2
+            'LetAppsAccessTrustedDevices' = 2
+            'LetAppsGetDiagnosticInfo' = 2
+            'LetAppsRunInBackground' = 2
+            'LetAppsActivateWithVoice' = 2
+            'LetAppsActivateWithVoiceAboveLock' = 2
+        }
+    }
+}
+
+function Get-StrictPrivacySupport {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $build = [Environment]::OSVersion.Version.Build
+    $editionId = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).EditionID
+    $supportedEditions = @('Professional', 'ProfessionalEducation', 'ProfessionalWorkstation', 'Enterprise', 'EnterpriseS', 'Education')
+    if ($os.ProductType -ne 1) {
+        return [pscustomobject]@{ Applicable = $false; Detail = "Windows Server does not expose the Windows client privacy baseline (ProductType=$($os.ProductType))." }
+    }
+    if ($build -lt 17763) {
+        return [pscustomobject]@{ Applicable = $false; Detail = "Windows build $build is older than the Windows 10 1809 privacy-policy baseline." }
+    }
+    if ($editionId -notin $supportedEditions) {
+        return [pscustomobject]@{ Applicable = $false; Detail = "Windows edition '$editionId' does not expose the required Pro/Enterprise/Education policy baseline." }
+    }
+    return [pscustomobject]@{ Applicable = $true; Detail = "Windows client build $build, edition '$editionId'." }
+}
+
+$privacyMode = Get-ConfigValue $Config @('privacy')
+$strictPrivacySupport = if ($privacyMode -eq 'strict') { Get-StrictPrivacySupport } else { $null }
+$privacySkip = if (-not $privacyMode) {
+    "no 'privacy' mode configured"
+} elseif ($privacyMode -ne 'strict') {
+    # Test-BootstrapConfig reports this before this step can run. Keep a
+    # defensive runtime guard for callers which bypassed normal preflight.
+    "privacy mode '$privacyMode' is invalid"
+} elseif (-not $strictPrivacySupport.Applicable) {
+    "not applicable: $($strictPrivacySupport.Detail)"
+} else { $null }
+
+Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason $privacySkip -Tag 'privacy' -Verify {
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    $values = Get-StrictPrivacyPolicyValues
+    foreach ($keyPath in $values.Keys) {
+        $existing = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
+        foreach ($name in $values[$keyPath].Keys) {
+            $desired = $values[$keyPath][$name]
+            $actual = if ($existing -and $existing.PSObject.Properties[$name]) { $existing.$name } else { $null }
+            if ($actual -ne $desired) { $mismatches.Add("$keyPath\\$name = $actual (expected $desired)") }
+        }
+    }
+    [pscustomobject]@{ Ok = ($mismatches.Count -eq 0); Detail = if ($mismatches.Count -eq 0) { 'strict device privacy policies are applied' } else { "mismatched: $($mismatches -join '; ')" } }
+} -Action {
+    if (-not $strictPrivacySupport.Applicable) { return }
+    $values = Get-StrictPrivacyPolicyValues
+    foreach ($keyPath in $values.Keys) {
+        if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
+        $existing = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
+        foreach ($name in $values[$keyPath].Keys) {
+            $desired = $values[$keyPath][$name]
+            $actual = if ($existing -and $existing.PSObject.Properties[$name]) { $existing.$name } else { $null }
+            if ($actual -ne $desired) { Set-ItemProperty -Path $keyPath -Name $name -Value $desired -Type DWord }
+        }
+    }
+    Write-Host 'Strict device privacy policies applied. Restart affected applications or Windows before relying on them.'
+}
+
+# ----------------------------------------------------------------------------
+# 10. Remove OneDrive
 # ----------------------------------------------------------------------------
 
 $oneDriveSkip = if (-not (Get-ConfigValue $Config @('remove_onedrive') $false)) {

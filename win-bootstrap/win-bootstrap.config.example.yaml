@@ -129,6 +129,14 @@ remove_outlook: true
 uac_level: default
 
 # ----------------------------------------------------------------------------
+# privacy
+# ----------------------------------------------------------------------------
+# Optional strict device-policy privacy baseline for supported Windows 10/11
+# Pro, Enterprise, and Education guests. It is reported as not applicable on
+# Windows Server and unsupported client editions, without policy changes.
+# privacy: strict
+
+# ----------------------------------------------------------------------------
 # install_powershell7
 # ----------------------------------------------------------------------------
 # Installs PowerShell 7 via the native MSI build (winget installer type
