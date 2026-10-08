@@ -887,6 +887,7 @@ A map. Configures what kind of memory dump Windows writes on a crash (BSOD). Omi
 kernel_debugging:
   enable: true
   target: dedicated
+  boot_menu_timeout: 20
   transport: serial
   serial:
     port: COM1
@@ -901,6 +902,7 @@ A map. Enables Windows kernel debugging (the `bcdedit /debug` + `/dbgsettings` c
 | `target` | Optional, default `current` | `current` enables debug on today's default boot entry, in place. `dedicated` finds or creates one script-managed copy of it (never duplicated across reruns) and enables debug there instead, leaving the original entry untouched. |
 | `default_profile` | Optional, default `current` | Only consulted when `target: dedicated` (harmless no-op otherwise). `current` keeps booting into the original entry (the dedicated debug entry is only reachable via the boot menu); `dedicated` switches the boot default to it. |
 | `legacy_boot_menu` | Optional, default `false` | `true` switches every boot loader entry's `bootmenupolicy` to `Legacy` (classic text-based boot menu, also re-enables the F8 Advanced Options menu) — applied to *all* entries at once, not just the one used for kernel debugging, since Windows only supports this per-entry, not as a single global switch. Mainly useful when `target: dedicated` needs a reliable way to pick between boot entries over a serial console/remote KVM where the modern graphical boot menu doesn't render well. Omit/`false` leaves the current policy alone. |
+| `boot_menu_timeout` | Optional, default `20` | Global `{bootmgr}` selection timeout in whole seconds (`0` through `999`). It is applied whenever `enable: true`, including when `legacy_boot_menu` is `false`; `0` selects the default entry immediately and leaves no interactive recovery window. Omit it to use Windows' normal 20-second default. |
 | `transport` | Required (to act) | `serial` \| `network` — which sub-block below is read. |
 | `serial.port` | Optional, default `COM1` | Serial port. |
 | `serial.baud_rate` | Optional, default `115200` | Baud rate. |

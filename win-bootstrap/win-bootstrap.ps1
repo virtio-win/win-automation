@@ -919,6 +919,17 @@ function Test-BootstrapConfig {
         }
     }
 
+    function Test-BootMenuTimeoutValue {
+        param($Value)
+        # bcdedit accepts an integer number of seconds. Keep the supported
+        # range deliberately small and explicit so a malformed YAML scalar
+        # cannot accidentally create a multi-hour recovery delay.
+        $parsed = 0
+        if (-not [int]::TryParse(([string]$Value).Trim(), [ref]$parsed) -or $parsed -lt 0 -or $parsed -gt 999) {
+            $problems.Add("kernel_debugging.boot_menu_timeout '$Value' is invalid - must be a whole number of seconds from 0 through 999.")
+        }
+    }
+
     function Test-Ipv4Address {
         param([string]$Address)
         if ($Address -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return $false }
@@ -1135,6 +1146,7 @@ function Test-BootstrapConfig {
     if ($kernelDebugDefaultProfile -notin $script:ValidKernelDebugTargets) {
         $problems.Add("kernel_debugging.default_profile '$kernelDebugDefaultProfile' is invalid - must be one of: $($script:ValidKernelDebugTargets -join ', ').")
     }
+    Test-BootMenuTimeoutValue -Value (Get-ConfigValue $Config @('kernel_debugging', 'boot_menu_timeout') 20)
     $kernelDebugTransport = Get-ConfigValue $Config @('kernel_debugging', 'transport')
     if ($kernelDebugTransport -and $kernelDebugTransport -notin $script:ValidKernelDebugTransports) {
         $problems.Add("kernel_debugging.transport '$kernelDebugTransport' is invalid - must be one of: $($script:ValidKernelDebugTransports -join ', ').")
@@ -2735,6 +2747,20 @@ function Get-BcdOsLoaderEntries {
     }
     if ($currentGuid) { $entries.Add([pscustomobject]@{ Guid = $currentGuid; BootMenuPolicy = $currentPolicy }) }
     return , @($entries)
+}
+
+# The boot-menu timeout belongs to {bootmgr}, unlike bootmenupolicy which is
+# per OS-loader entry. Return $null when bcdedit does not print a parseable
+# timeout so the caller repairs that state rather than assuming a default.
+function Get-BcdBootManagerTimeout {
+    $output = & bcdedit.exe /enum '{bootmgr}'
+    if ($LASTEXITCODE -ne 0) { throw "bcdedit /enum {bootmgr} failed (exit $LASTEXITCODE)" }
+    foreach ($line in $output) {
+        if ($line -match '^timeout\s+(\d+)\s*$') {
+            return [int]$Matches[1]
+        }
+    }
+    return $null
 }
 
 # On a freshly bootstrapped machine, Get-ExecutionPolicy/the Cert:\ drive/
@@ -5094,6 +5120,22 @@ Invoke-Step -Name 'Configure boot menu policy (legacy vs modern)' -SkipReason $l
         }
     }
     Write-Host "Set bootmenupolicy to Legacy on $changed of $($entries.Count) boot loader entry/entries (all-or-nothing: applies to every entry, not just the one used for kernel debugging)."
+}
+
+# This is intentionally coupled to kernel_debugging.enable. A config that
+# disables kernel debugging must leave BCD entirely alone, including the
+# global {bootmgr} timeout. When debugging is enabled, use Windows' normal
+# 20-second default unless the profile explicitly overrides it.
+$kernelDebugBootMenuTimeout = Get-ConfigValue $Config @('kernel_debugging', 'boot_menu_timeout') 20
+$kernelDebugBootMenuTimeoutSkip = if (-not $kernelDebugEnabled) { "'kernel_debugging.enable' is not set to true" } else { $null }
+
+Invoke-Step -Name 'Configure boot menu timeout' -SkipReason $kernelDebugBootMenuTimeoutSkip -Tag 'kernel_debugging' -Verify {
+    $currentTimeout = Get-BcdBootManagerTimeout
+    [pscustomobject]@{ Ok = ($currentTimeout -eq [int]$kernelDebugBootMenuTimeout); Detail = "boot manager timeout=$currentTimeout seconds (wanted $kernelDebugBootMenuTimeout)" }
+} -Action {
+    & bcdedit.exe /timeout $kernelDebugBootMenuTimeout | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "bcdedit /timeout $kernelDebugBootMenuTimeout failed (exit $LASTEXITCODE)" }
+    Write-Host "Set boot menu timeout to $kernelDebugBootMenuTimeout seconds."
 }
 
 # The debugger transport (/dbgsettings) is a GLOBAL BCD object shared by
