@@ -586,6 +586,11 @@ crash_dump:
 #   console/remote KVM where the modern graphical boot menu doesn't
 #   render well.
 #
+# boot_menu_timeout: non-negative whole seconds, optional, default: 20
+#   Sets the global {bootmgr} selection timeout whenever enable: true. Use 0
+#   only when a dedicated default profile has a separate recovery path; it
+#   leaves no time to select a different boot entry interactively.
+#
 # transport: serial | network - which one is read depends on this value;
 # the other block can be left in place unused, same as elsewhere in this
 # config. Note dbgsettings is a single GLOBAL BCD object shared by *any*
@@ -597,6 +602,7 @@ kernel_debugging:
   target: dedicated
   # default_profile: dedicated
   # legacy_boot_menu: true
+  # boot_menu_timeout: 20
   transport: serial
   serial:
     port: COM1
