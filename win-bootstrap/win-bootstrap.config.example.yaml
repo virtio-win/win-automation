@@ -133,7 +133,10 @@ uac_level: default
 # ----------------------------------------------------------------------------
 # Optional strict device-policy privacy baseline for supported Windows 10/11
 # Pro, Enterprise, and Education guests. It is reported as not applicable on
-# Windows Server and unsupported client editions, without policy changes.
+# Windows Server and unsupported client editions, without policy changes. It
+# suppresses first-login privacy UI and disables location, advertising,
+# cross-device activity/clipboard, consumer content, and App Privacy access;
+# see docs/windows-bootstrap.md#privacy for the exact effects and trade-offs.
 # privacy: strict
 
 # ----------------------------------------------------------------------------

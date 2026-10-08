@@ -594,19 +594,28 @@ not supported on Windows Server, Windows Home, or older client releases; the
 step is reported as not applicable and makes no policy changes on those
 systems.
 
-The baseline uses documented Group Policy registry mappings. It suppresses the
-privacy experience for newly created users, disables location, advertising ID,
-online speech personalization, consumer content, activity/cloud sharing, and
-forces denial of the documented App Privacy capabilities. Diagnostic data is
-limited to **Required**, rather than claiming that Windows 11 Pro can disable
-all diagnostics. It also limits diagnostic log and dump collection and removes
-the diagnostic-data opt-in UI.
+The baseline uses documented Group Policy registry mappings. It is a device
+policy: it applies to every local user, including accounts created later by
+`local_users`. The following is the complete intended effect of `strict`.
 
-This is intentionally not a generic registry-writing feature. It affects all
-local users and can disable camera, microphone, Store-app notifications, and
-other app features. Use it only for an isolated lab target where that is the
-intended policy. It does not disable networking, RDP, Windows Update, Windows
-activation, or Windows Defender.
+| Area | `strict` enforces | Practical consequence |
+| --- | --- | --- |
+| First sign-in privacy page | Suppresses the Windows privacy-experience screen for newly created users. | A new account does not have to walk through the location/diagnostics privacy UI before reaching its desktop. This does not skip account creation, profile initialization, or the rest of Windows OOBE. |
+| Location, advertising, and personalization | Disables device location, advertising ID, and input/online-speech personalization. | Applications cannot obtain location through the Windows location service; personalised ads and cloud-backed typing/speech personalisation are disabled. |
+| Diagnostics and feedback | Sets diagnostic data to **Required** (`AllowTelemetry=1`), removes the telemetry opt-in UI, limits diagnostic logs and dump collection, and disables feedback notifications. | It deliberately does **not** promise telemetry level `0`: that level is not supported by ordinary Windows 11 Pro. Windows can still send Required diagnostic data. |
+| Cross-device activity | Disables Activity Feed, activity publication/upload, Connected Devices Platform (CDP), and cross-device clipboard. | Windows does not publish work/activity history or synchronise clipboard/activity data with other devices. Features depending on Phone Link, nearby/cross-device integration, or shared clipboard can be affected. |
+| Consumer content | Disables Windows consumer features. | Windows suppresses consumer recommendations and automatic promotional/consumer app provisioning. This does not disable Microsoft Store, Windows Update, or ordinary desktop application installation. |
+| App Privacy capabilities | Forces denial (`2`, the documented *force deny* policy value) for account info, calendar, call history, camera, contacts, email, location, messaging, microphone, motion, notifications, phone, radios, tasks, trusted devices, diagnostic information, background execution, and voice activation (including above the lock screen). | A user cannot simply re-enable those capabilities in Settings. Store/UWP apps that require one of them will have reduced functionality or fail that feature. Desktop applications which access hardware outside the App Privacy framework can behave differently. |
+
+This is intentionally not a generic registry-writing feature. Use it only for
+an isolated lab target where those restrictions are intended. It does not
+disable networking, RDP, Windows Update, Windows activation, Windows Defender,
+or the Microsoft Store itself.
+
+`-Verify` compares every managed value with this baseline and reports the
+privacy step as not applied when any value differs. On Windows Server, Home,
+or an unsupported older client it reports the step as not applicable instead of
+writing speculative registry values.
 
 ### `apps`
 
