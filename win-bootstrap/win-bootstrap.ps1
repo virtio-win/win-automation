@@ -1029,8 +1029,13 @@ function Test-BootstrapConfig {
 
     # privacy
     $privacyMode = Get-ConfigValue $Config @('privacy')
-    if ($privacyMode -and $privacyMode -notin $script:ValidPrivacyModes) {
-        $problems.Add("privacy '$privacyMode' is invalid - must be one of: $($script:ValidPrivacyModes -join ', ').")
+    # An absent privacy key is optional.  Do not use truthiness here: the
+    # restricted YAML parser maps `false` and `no` to $false, and accepting
+    # that value would silently disable a configured privacy baseline.
+    $privacyConfigured = $Config -is [System.Collections.IDictionary] -and $Config.Contains('privacy')
+    if ($privacyConfigured -and $privacyMode -notin $script:ValidPrivacyModes) {
+        $reportedPrivacyMode = if ($null -eq $privacyMode) { '<null>' } else { $privacyMode }
+        $problems.Add("privacy '$reportedPrivacyMode' is invalid - must be one of: $($script:ValidPrivacyModes -join ', ').")
     }
 
     # power
@@ -1802,7 +1807,10 @@ function Invoke-Step {
         # decide "already correct, skip" - used only under -Verify. Must
         # return [pscustomobject]@{ Ok = <bool>; Detail = '<string>' }.
         [scriptblock]$Verify,
-        [string]$SkipReason,
+        # A script block is evaluated only after tag filtering.  This lets a
+        # step defer environment-dependent eligibility checks until the step
+        # is actually selected by -Only/-Skip.
+        $SkipReason,
         [string[]]$Tag = @()
     )
 
@@ -1818,7 +1826,15 @@ function Invoke-Step {
             $tagSkipReason = "tag(s) '$($Tag -join ', ')' excluded via -Skip"
         }
     }
-    $effectiveSkipReason = if ($tagSkipReason) { $tagSkipReason } else { $SkipReason }
+    $effectiveSkipReason = if ($tagSkipReason) {
+        $tagSkipReason
+    }
+    elseif ($SkipReason -is [scriptblock]) {
+        & $SkipReason
+    }
+    else {
+        $SkipReason
+    }
 
     Write-Host "==> $Name" -ForegroundColor Cyan
 
@@ -3481,18 +3497,24 @@ function Get-StrictPrivacySupport {
 }
 
 $privacyMode = Get-ConfigValue $Config @('privacy')
-$strictPrivacySupport = if ($privacyMode -eq 'strict') { Get-StrictPrivacySupport } else { $null }
-$privacySkip = if (-not $privacyMode) {
-    "no 'privacy' mode configured"
-} elseif ($privacyMode -ne 'strict') {
-    # Test-BootstrapConfig reports this before this step can run. Keep a
-    # defensive runtime guard for callers which bypassed normal preflight.
-    "privacy mode '$privacyMode' is invalid"
-} elseif (-not $strictPrivacySupport.Applicable) {
-    "not applicable: $($strictPrivacySupport.Detail)"
-} else { $null }
+$script:StrictPrivacySupport = $null
 
-Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason $privacySkip -Tag 'privacy' -Verify {
+Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason {
+    $privacyConfigured = $Config -is [System.Collections.IDictionary] -and $Config.Contains('privacy')
+    if (-not $privacyConfigured) {
+        return "no 'privacy' mode configured"
+    }
+    if ($privacyMode -ne 'strict') {
+        # Test-BootstrapConfig reports this before this step can run. Keep a
+        # defensive runtime guard for callers which bypassed normal preflight.
+        return "privacy mode '$privacyMode' is invalid"
+    }
+    $script:StrictPrivacySupport = Get-StrictPrivacySupport
+    if (-not $script:StrictPrivacySupport.Applicable) {
+        return "not applicable: $($script:StrictPrivacySupport.Detail)"
+    }
+    return $null
+} -Tag 'privacy' -Verify {
     $mismatches = [System.Collections.Generic.List[string]]::new()
     $values = Get-StrictPrivacyPolicyValues
     foreach ($keyPath in $values.Keys) {
@@ -3505,7 +3527,7 @@ Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason $privacySkip
     }
     [pscustomobject]@{ Ok = ($mismatches.Count -eq 0); Detail = if ($mismatches.Count -eq 0) { 'strict device privacy policies are applied' } else { "mismatched: $($mismatches -join '; ')" } }
 } -Action {
-    if (-not $strictPrivacySupport.Applicable) { return }
+    if (-not $script:StrictPrivacySupport.Applicable) { return }
     $values = Get-StrictPrivacyPolicyValues
     foreach ($keyPath in $values.Keys) {
         if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }

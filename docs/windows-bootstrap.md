@@ -592,7 +592,8 @@ privacy: strict
 newer and Windows 11 client editions Pro, Enterprise, and Education. It is
 not supported on Windows Server, Windows Home, or older client releases; the
 step is reported as not applicable and makes no policy changes on those
-systems.
+systems. Omit `privacy` to leave this step disabled; if the key is present,
+`strict` is its only accepted value (do not use `false` or `no`).
 
 The baseline uses documented Group Policy registry mappings. It is a device
 policy: it applies to every local user, including accounts created later by
