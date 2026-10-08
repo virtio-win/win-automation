@@ -3419,7 +3419,11 @@ Invoke-Step -Name 'Disable Virtualization-Based Security (Core Isolation)' -Skip
 # system where it is not applicable; it never writes speculative values to a
 # Server or unsupported Windows edition just to make verification look green.
 function Get-StrictPrivacyPolicyValues {
-    return @{
+    param(
+        [switch]$IncludeConsumerFeatures
+    )
+
+    $values = @{
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' = @{
             'DisablePrivacyExperience' = 1
         }
@@ -3449,9 +3453,6 @@ function Get-StrictPrivacyPolicyValues {
             'UploadUserActivities' = 0
             'EnableCdp' = 0
         }
-        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' = @{
-            'DisableWindowsConsumerFeatures' = 1
-        }
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' = @{
             # 2 is the documented Force Deny value for each App Privacy
             # policy.  These are device policies and therefore cover the
@@ -3477,6 +3478,15 @@ function Get-StrictPrivacyPolicyValues {
             'LetAppsActivateWithVoiceAboveLock' = 2
         }
     }
+    # Microsoft supports this policy on Enterprise and Education, but not
+    # Windows Pro.  Do not mistake a successfully written registry value on
+    # Pro for an enforced policy.
+    if ($IncludeConsumerFeatures) {
+        $values['HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'] = @{
+            'DisableWindowsConsumerFeatures' = 1
+        }
+    }
+    return $values
 }
 
 function Get-StrictPrivacySupport {
@@ -3493,7 +3503,13 @@ function Get-StrictPrivacySupport {
     if ($editionId -notin $supportedEditions) {
         return [pscustomobject]@{ Applicable = $false; Detail = "Windows edition '$editionId' does not expose the required Pro/Enterprise/Education policy baseline." }
     }
-    return [pscustomobject]@{ Applicable = $true; Detail = "Windows client build $build, edition '$editionId'." }
+    $consumerFeaturesSupported = $editionId -in @('Enterprise', 'EnterpriseS', 'Education')
+    return [pscustomobject]@{
+        Applicable = $true
+        Detail = "Windows client build $build, edition '$editionId'."
+        EditionId = $editionId
+        ConsumerFeaturesSupported = $consumerFeaturesSupported
+    }
 }
 
 $privacyMode = Get-ConfigValue $Config @('privacy')
@@ -3516,7 +3532,7 @@ Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason {
     return $null
 } -Tag 'privacy' -Verify {
     $mismatches = [System.Collections.Generic.List[string]]::new()
-    $values = Get-StrictPrivacyPolicyValues
+    $values = Get-StrictPrivacyPolicyValues -IncludeConsumerFeatures:$script:StrictPrivacySupport.ConsumerFeaturesSupported
     foreach ($keyPath in $values.Keys) {
         $existing = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
         foreach ($name in $values[$keyPath].Keys) {
@@ -3525,10 +3541,16 @@ Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason {
             if ($actual -ne $desired) { $mismatches.Add("$keyPath\\$name = $actual (expected $desired)") }
         }
     }
-    [pscustomobject]@{ Ok = ($mismatches.Count -eq 0); Detail = if ($mismatches.Count -eq 0) { 'strict device privacy policies are applied' } else { "mismatched: $($mismatches -join '; ')" } }
+    $consumerFeaturesDetail = if ($script:StrictPrivacySupport.ConsumerFeaturesSupported) {
+        ''
+    }
+    else {
+        "; Windows consumer-features policy is unavailable on edition '$($script:StrictPrivacySupport.EditionId)' and is not managed"
+    }
+    [pscustomobject]@{ Ok = ($mismatches.Count -eq 0); Detail = if ($mismatches.Count -eq 0) { "strict device privacy policies are applied$consumerFeaturesDetail" } else { "mismatched: $($mismatches -join '; ')$consumerFeaturesDetail" } }
 } -Action {
     if (-not $script:StrictPrivacySupport.Applicable) { return }
-    $values = Get-StrictPrivacyPolicyValues
+    $values = Get-StrictPrivacyPolicyValues -IncludeConsumerFeatures:$script:StrictPrivacySupport.ConsumerFeaturesSupported
     foreach ($keyPath in $values.Keys) {
         if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
         $existing = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
@@ -3537,6 +3559,9 @@ Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason {
             $actual = if ($existing -and $existing.PSObject.Properties[$name]) { $existing.$name } else { $null }
             if ($actual -ne $desired) { Set-ItemProperty -Path $keyPath -Name $name -Value $desired -Type DWord }
         }
+    }
+    if (-not $script:StrictPrivacySupport.ConsumerFeaturesSupported) {
+        Write-Host "Windows consumer-features policy is unavailable on edition '$($script:StrictPrivacySupport.EditionId)' and was not managed."
     }
     Write-Host 'Strict device privacy policies applied. Restart affected applications or Windows before relying on them.'
 }

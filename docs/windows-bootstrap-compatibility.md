@@ -14,7 +14,7 @@ The table below describes the current implementation. It is not a guarantee that
 | Windows Terminal | Client/desktop only | Not supported | Limited; WinGet required | Desktop Experience only |
 | OpenSSH Server | Supported | Limited; current flow uses WinGet | Limited; current flow uses WinGet | Limited; current flow uses WinGet |
 | Windows `sudo` | Windows 11 24H2+ only | Not supported | Not supported | Not supported |
-| Strict privacy baseline | Supported on Pro, Enterprise, and Education (Windows 10 1809+ / Windows 11) | Not applicable; no policy writes | Not applicable; no policy writes | Not applicable; no policy writes |
+| Strict privacy baseline | Supported on Pro, Enterprise, and Education (Windows 10 1809+ / Windows 11). The consumer-features policy is managed only on Enterprise and Education. | Not applicable; no policy writes | Not applicable; no policy writes | Not applicable; no policy writes |
 | Desktop removal and first-login setup | Supported where applicable | Desktop Experience only | Desktop Experience only | Desktop Experience only |
 | VBS/Credential Guard changes | Supported with limitations | Limited | Limited | Limited; policy/UEFI may override |
 

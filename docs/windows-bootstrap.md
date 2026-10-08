@@ -605,7 +605,7 @@ policy: it applies to every local user, including accounts created later by
 | Location, advertising, and personalization | Disables device location, advertising ID, and input/online-speech personalization. | Applications cannot obtain location through the Windows location service; personalised ads and cloud-backed typing/speech personalisation are disabled. |
 | Diagnostics and feedback | Sets diagnostic data to **Required** (`AllowTelemetry=1`), removes the telemetry opt-in UI, limits diagnostic logs and dump collection, and disables feedback notifications. | It deliberately does **not** promise telemetry level `0`: that level is not supported by ordinary Windows 11 Pro. Windows can still send Required diagnostic data. |
 | Cross-device activity | Disables Activity Feed, activity publication/upload, Connected Devices Platform (CDP), and cross-device clipboard. | Windows does not publish work/activity history or synchronise clipboard/activity data with other devices. Features depending on Phone Link, nearby/cross-device integration, or shared clipboard can be affected. |
-| Consumer content | Disables Windows consumer features. | Windows suppresses consumer recommendations and automatic promotional/consumer app provisioning. This does not disable Microsoft Store, Windows Update, or ordinary desktop application installation. |
+| Consumer content | On Enterprise and Education, disables Windows consumer features. On Pro, this policy is unavailable and is intentionally not managed. | On supported editions, Windows suppresses consumer recommendations and automatic promotional/consumer app provisioning. This does not disable Microsoft Store, Windows Update, or ordinary desktop application installation. |
 | App Privacy capabilities | Forces denial (`2`, the documented *force deny* policy value) for account info, calendar, call history, camera, contacts, email, location, messaging, microphone, motion, notifications, phone, radios, tasks, trusted devices, diagnostic information, background execution, and voice activation (including above the lock screen). | A user cannot simply re-enable those capabilities in Settings. Store/UWP apps that require one of them will have reduced functionality or fail that feature. Desktop applications which access hardware outside the App Privacy framework can behave differently. |
 
 This is intentionally not a generic registry-writing feature. Use it only for
@@ -613,10 +613,12 @@ an isolated lab target where those restrictions are intended. It does not
 disable networking, RDP, Windows Update, Windows activation, Windows Defender,
 or the Microsoft Store itself.
 
-`-Verify` compares every managed value with this baseline and reports the
-privacy step as not applied when any value differs. On Windows Server, Home,
-or an unsupported older client it reports the step as not applicable instead of
-writing speculative registry values.
+`-Verify` compares every value managed for the current edition with this
+baseline and reports the privacy step as not applied when any value differs.
+It explicitly reports that the consumer-features policy is unavailable and
+unmanaged on Pro. On Windows Server, Home, or an unsupported older client it
+reports the step as not applicable instead of writing speculative registry
+values.
 
 ### `apps`
 
