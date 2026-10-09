@@ -5196,20 +5196,6 @@ Invoke-Step -Name 'Configure kernel debugger transport' -SkipReason $kernelDebug
 
         $current = (& bcdedit.exe /dbgsettings) -join "`n"
 
-        # busparams pins the debug transport to a specific PCI
-        # bus.device.function - independent of the host/port/key, and
-        # carries no secret, so it's always safe to (re)apply on every
-        # run regardless of the "don't touch an existing key" guard below.
-        if ($busParams) {
-            $busParamsOk = $current -match "(?im)^busparams\s+$([regex]::Escape($busParams))\b"
-            if (-not $busParamsOk) {
-                & bcdedit.exe /set '{dbgsettings}' busparams $busParams | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "bcdedit /set '{dbgsettings}' busparams $busParams failed (exit $LASTEXITCODE)" }
-                Write-Host "Kernel debugger busparams set to $busParams."
-                $current = (& bcdedit.exe /dbgsettings) -join "`n"
-            }
-        }
-
         $alreadySet = ($current -match '(?im)^debugtype\s+Net') -and ($current -match "(?im)^hostip\s+$([regex]::Escape("$hostIp"))\b") -and ($current -match "(?im)^port\s+$port\b")
         if ($alreadySet) {
             # Never touch an already-configured network key, generated or
@@ -5217,25 +5203,39 @@ Invoke-Step -Name 'Configure kernel debugger transport' -SkipReason $kernelDebug
             # local_users' password handling; regenerating would silently
             # break trust with whatever debug host already has the old key.
             Write-Host "Kernel debugger transport already set to network ($hostIp`:$port), leaving key untouched."
-            return
         }
-
-        if ($generate) {
+        else {
+            if ($generate) {
             $genOutput = & bcdedit.exe /dbgsettings NET "HOSTIP:$hostIp" "PORT:$port" 'KEY:GENERATE'
             if ($LASTEXITCODE -ne 0) { throw "bcdedit /dbgsettings NET (generate) failed (exit $LASTEXITCODE): $genOutput" }
             $keyMatch = ($genOutput -join ' ') | Select-String -Pattern '([0-9A-Za-z]{4}[.\-][0-9A-Za-z]{4}[.\-][0-9A-Za-z]{4}[.\-][0-9A-Za-z]{4})'
             if (-not $keyMatch) { throw "Could not parse generated debug key from bcdedit output: $genOutput" }
             $revealKey = $keyMatch.Matches[0].Groups[1].Value
-        }
-        else {
+            }
+            else {
             $resolvedKey = Resolve-ConfigResource -InlineValue $inlineKey -PathValue $keyPath -UrlValue $keyUrl `
                 -SecretIdValue $keySecretId -Description 'kernel_debugging.network.key'
             & bcdedit.exe /dbgsettings NET "HOSTIP:$hostIp" "PORT:$port" "KEY:$resolvedKey" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "bcdedit /dbgsettings NET failed (exit $LASTEXITCODE)" }
+            }
+            Write-Host "Kernel debugger transport set to network ($hostIp`:$port)."
         }
-        Write-Host "Kernel debugger transport set to network ($hostIp`:$port)."
 
-        if ($generate) {
+        # bcdedit /dbgsettings NET can replace the network transport object
+        # and discard a previously written busparams value.  Pin the PCI
+        # transport only after NET has been confirmed, on every run, without
+        # ever touching the already-established KDNET key.
+        if ($busParams) {
+            $current = (& bcdedit.exe /dbgsettings) -join "`n"
+            $busParamsOk = $current -match "(?im)^busparams\s+$([regex]::Escape($busParams))\b"
+            if (-not $busParamsOk) {
+                & bcdedit.exe /set '{dbgsettings}' busparams $busParams | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "bcdedit /set '{dbgsettings}' busparams $busParams failed (exit $LASTEXITCODE)" }
+                Write-Host "Kernel debugger busparams set to $busParams."
+            }
+        }
+
+        if ($generate -and -not $alreadySet) {
             # Same reveal-once convention as local_users' generated
             # passwords - console if interactive, locked-down file next to
             # the script under -Quiet.
