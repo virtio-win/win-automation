@@ -2196,12 +2196,21 @@ function Resolve-ShellExecutablePath {
                 return $path
             }
             if ($RequireNativeWin32Install) {
+                # The command to run is wrapped in ANSI bold-cyan so it stands
+                # out from the surrounding text instead of blending into one
+                # wall of (host-colored) warning text - Write-Warning doesn't
+                # expose any way to color only part of a message, and every
+                # supported console (Windows Terminal, and conhost since
+                # Windows 10 1511+) renders these escape codes natively.
+                $esc = [char]27
+                $highlightOn = "$esc[1;36m"
+                $highlightOff = "$esc[0m"
                 throw ("PowerShell 7 was not found as a native Win32 install (C:\Program Files\PowerShell\7\pwsh.exe).`n" +
                     "The default Microsoft Store/MSIX-packaged build is not reliably usable as an OpenSSH default shell.`n" +
                     "Fix: set 'install_powershell7: true' in config - this installs winget's native 'wix' MSI build.`n" +
                     "If PowerShell 7 was already installed via MSIX, first remove it (winget refuses to switch installer`n" +
                     "types on an already-installed package):`n" +
-                    "  winget uninstall --id Microsoft.PowerShell --source winget`n" +
+                    "  ${highlightOn}winget uninstall --id Microsoft.PowerShell --source winget${highlightOff}`n" +
                     "then re-run this script.")
             }
             $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
