@@ -831,16 +831,21 @@ function Resolve-ConfigList {
 # (and more may be added later) - a hardcoded per-field list would itself
 # need manual upkeep every time a new one is added.
 function Find-ConfigSecretIdFields {
+    # Returns one [pscustomobject]@{ Path; Value } per '*_secret_id' field
+    # found - the path for error messages (see Test-BootstrapConfig below),
+    # the value so callers (see the Bitwarden Secrets Manager pre-flight
+    # check further down) can resolve an actual secret without a second
+    # config walk.
     param(
         $Node,
         [string]$Path = ''
     )
-    $found = [System.Collections.Generic.List[string]]::new()
+    $found = [System.Collections.Generic.List[pscustomobject]]::new()
     if ($Node -is [System.Collections.IDictionary]) {
         foreach ($key in $Node.Keys) {
             $childPath = if ($Path) { "$Path.$key" } else { $key }
             if ($key -like '*_secret_id' -and $Node[$key]) {
-                $found.Add($childPath)
+                $found.Add([pscustomobject]@{ Path = $childPath; Value = $Node[$key] })
             }
             else {
                 # AddRange requires a strongly-typed IEnumerable[string] -
@@ -848,8 +853,8 @@ function Find-ConfigSecretIdFields {
                 # System.Object[] (even though every element is a string),
                 # which AddRange rejects outright. A plain foreach+Add
                 # sidesteps that type-matching entirely.
-                foreach ($nestedPath in (Find-ConfigSecretIdFields -Node $Node[$key] -Path $childPath)) {
-                    $found.Add($nestedPath)
+                foreach ($nested in (Find-ConfigSecretIdFields -Node $Node[$key] -Path $childPath)) {
+                    $found.Add($nested)
                 }
             }
         }
@@ -857,8 +862,8 @@ function Find-ConfigSecretIdFields {
     elseif ($Node -is [System.Collections.IEnumerable] -and $Node -isnot [string]) {
         $i = 0
         foreach ($item in $Node) {
-            foreach ($nestedPath in (Find-ConfigSecretIdFields -Node $item -Path "$Path[$i]")) {
-                $found.Add($nestedPath)
+            foreach ($nested in (Find-ConfigSecretIdFields -Node $item -Path "$Path[$i]")) {
+                $found.Add($nested)
             }
             $i++
         }
@@ -1174,7 +1179,7 @@ function Test-BootstrapConfig {
     }
     $secretIdFields = Find-ConfigSecretIdFields -Node $Config
     if ($secretIdFields.Count -gt 0 -and $secretManager -notin $script:ValidSecretManagers) {
-        $problems.Add("Config uses '_secret_id' at $($secretIdFields -join ', '), but 'secret_manager' is not set to a supported value ('bws' is the only one supported today) - add 'secret_manager: bws' at the top level.")
+        $problems.Add("Config uses '_secret_id' at $($secretIdFields.Path -join ', '), but 'secret_manager' is not set to a supported value ('bws' is the only one supported today) - add 'secret_manager: bws' at the top level.")
     }
 
     return , @($problems)
@@ -1738,7 +1743,18 @@ function Get-BwsSecretValue {
     }
 
     $bwsPath = Install-BwsCli
-    $output = & $bwsPath secret get $SecretId 2>&1
+    # $ErrorActionPreference is 'Stop' script-wide, which (a long-standing
+    # PowerShell gotcha) turns ANY line a native command writes to stderr
+    # into a terminating error the instant '2>&1' merges it in - regardless
+    # of exit code, and before the $LASTEXITCODE check below ever runs. That
+    # previously surfaced as a bare, truncated "Error:" with the real detail
+    # (and sometimes the exit code check itself) never reached. Scoping
+    # 'Continue' to this call only lets $output capture the full output and
+    # the exit-code check below be what actually decides success/failure.
+    $output = & {
+        $ErrorActionPreference = 'Continue'
+        & $bwsPath secret get $SecretId 2>&1
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "bws secret get '$SecretId' failed (exit $LASTEXITCODE): $output"
     }
@@ -2126,7 +2142,13 @@ function Resolve-ShellExecutablePath {
                 return $path
             }
             if ($RequireNativeWin32Install) {
-                throw 'PowerShell 7 was not found as a native Win32 install (C:\Program Files\PowerShell\7\pwsh.exe). The default Microsoft Store/MSIX-packaged build is not reliably usable as an OpenSSH default shell. Set "install_powershell7: true" in config (installs winget''s native "wix" MSI build) - if it was already installed via MSIX, run "winget uninstall --id Microsoft.PowerShell --source winget" first, since winget refuses to switch installer types on an already-installed package, then re-run this script.'
+                throw ("PowerShell 7 was not found as a native Win32 install (C:\Program Files\PowerShell\7\pwsh.exe).`n" +
+                    "The default Microsoft Store/MSIX-packaged build is not reliably usable as an OpenSSH default shell.`n" +
+                    "Fix: set 'install_powershell7: true' in config - this installs winget's native 'wix' MSI build.`n" +
+                    "If PowerShell 7 was already installed via MSIX, first remove it (winget refuses to switch installer`n" +
+                    "types on an already-installed package):`n" +
+                    "  winget uninstall --id Microsoft.PowerShell --source winget`n" +
+                    "then re-run this script.")
             }
             $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
             if ($command) {
@@ -2952,6 +2974,37 @@ if ($windowsTerminalWantsPowershell7) { $powershell7Dependents += 'windows_termi
 if ($sshWantsPowershell7) { $powershell7Dependents += 'ssh_server.default_shell: pwsh7' }
 
 Assert-ConfigNoConflicts -Config $Config -InstallPowershell7Config $installPowershell7Config -Powershell7Dependents $powershell7Dependents
+
+# Pre-flight: verify Bitwarden Secrets Manager access actually works, if the
+# config uses it, before any system-modifying step below runs. Config
+# structure (secret_manager: bws set, _secret_id fields well-formed) is
+# already checked above by Assert-ConfigNoConflicts, but that's static - it
+# can't catch a missing/expired/wrong BWS_ACCESS_TOKEN. Resolving one real
+# secret now both proves access works and warms Get-BwsSecretValue's cache
+# for that id. Skipped under -Verify, which must never modify machine state
+# (installing the bws CLI and adding it to the machine PATH, done as a side
+# effect of the first real bws call, would violate that).
+#
+# Gated on secret_manager being 'bws' specifically, not merely on
+# '_secret_id' fields being present: today 'bws' is the only value
+# $script:ValidSecretManagers accepts, so Assert-ConfigNoConflicts above
+# already guarantees the two go together - but that list is written to grow,
+# and this check must not assume a bws-specific resolution path for some
+# future secret manager's ids.
+if (-not $script:VerifyMode) {
+    $secretManagerForPreflight = Get-ConfigValue $Config @('secret_manager')
+    $secretIdFieldsForPreflight = Find-ConfigSecretIdFields -Node $Config
+    if ($secretManagerForPreflight -eq 'bws' -and $secretIdFieldsForPreflight.Count -gt 0) {
+        Write-Host "Verifying Bitwarden Secrets Manager access ($($secretIdFieldsForPreflight.Count) secret(s) referenced in config)..." -ForegroundColor Cyan
+        try {
+            Get-BwsSecretValue -SecretId $secretIdFieldsForPreflight[0].Value | Out-Null
+        }
+        catch {
+            throw "Bitwarden Secrets Manager access check failed before making any changes to this machine - $($_.Exception.Message) Verify `$env:BWS_ACCESS_TOKEN is correct, then re-run bootstrap."
+        }
+        Write-Host 'Bitwarden Secrets Manager access verified.' -ForegroundColor Cyan
+    }
+}
 
 # -Only/-Skip filter by tag with no awareness of cross-tag dependencies -
 # only the config-level conflict above (install_powershell7: false vs. a
@@ -5357,7 +5410,13 @@ function Get-PowerSettingMinutes {
         [Parameter(Mandatory)] [string]$SubGroup,
         [Parameter(Mandatory)] [string]$Setting
     )
-    $output = powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>&1 | Out-String
+    # See the matching comment in Get-BwsSecretValue: 'Continue' is scoped to
+    # this call so a stray stderr line from powercfg can't turn into a
+    # terminating error under the script-wide $ErrorActionPreference = 'Stop'.
+    $output = & {
+        $ErrorActionPreference = 'Continue'
+        powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>&1
+    } | Out-String
     $acMatch = [regex]::Match($output, 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)')
     $dcMatch = [regex]::Match($output, 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)')
     [pscustomobject]@{
