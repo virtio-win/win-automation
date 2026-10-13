@@ -874,6 +874,39 @@ function Find-ConfigSecretIdFields {
     return , @($found)
 }
 
+# Maps a '_secret_id' field's path (as returned by Find-ConfigSecretIdFields
+# above) to the Invoke-Step -Tag value(s) of the step(s) that actually
+# resolve it, so the Bitwarden Secrets Manager pre-flight check further down
+# can tell whether a given secret is even reachable by this run's -Only/-Skip
+# selection. Kept in sync with those steps' own -Tag declarations by hand -
+# Find-ConfigSecretIdFields has no other way to know which step owns a given
+# field. An unrecognized path shape (e.g. a new secret_id field added without
+# updating this map) deliberately falls through to an empty tag list, which
+# Test-TagActive treats as always-active - failing safe by over-checking
+# rather than silently skipping a real dependency.
+function Get-SecretFieldTags {
+    param([Parameter(Mandatory)] [string]$Path)
+    if ($Path -match '^local_users(\[\d+\])?\.ssh_keys') {
+        return @('local_users', 'ssh')
+    }
+    if ($Path -like 'local_users*') {
+        return @('local_users')
+    }
+    if ($Path -like 'root_ca*') {
+        return @('root_ca')
+    }
+    if ($Path -like 'ssh_server*') {
+        return @('ssh')
+    }
+    if ($Path -like 'kernel_debugging*') {
+        return @('kernel_debugging')
+    }
+    if ($Path -like 'windows_product_key_secret_id') {
+        return @('product_key')
+    }
+    return @()
+}
+
 # Statically validates an entire parsed config against the rules every step
 # already enforces at runtime (required fields, enum values, mutual
 # exclusivity) - no machine-state inspection, no network/registry/file
@@ -1827,6 +1860,27 @@ $script:NetworkConfigToApplyNow = $null
 # across runs.
 $script:BwsSecretCache = @{}
 
+# Whether a set of tags would actually run under the current -Only/-Skip
+# filters - same semantics Invoke-Step applies to its own -Tag parameter
+# (run if any tag is in -Only, or -Only is empty; never run if any tag is in
+# -Skip), exposed standalone so something that isn't itself a step - like
+# the Bitwarden Secrets Manager pre-flight check further down - can ask
+# "would any step needing this actually run?" before doing work on its
+# behalf.
+function Test-TagActive {
+    param([string[]]$Tag = @())
+    if ($Tag.Count -eq 0) {
+        return $true
+    }
+    if ($script:OnlyTags.Count -gt 0 -and @($Tag | Where-Object { $_ -in $script:OnlyTags }).Count -eq 0) {
+        return $false
+    }
+    if ($script:SkipTags.Count -gt 0 -and @($Tag | Where-Object { $_ -in $script:SkipTags }).Count -gt 0) {
+        return $false
+    }
+    return $true
+}
+
 function Invoke-Step {
     param(
         [Parameter(Mandatory)] [string]$Name,
@@ -1846,12 +1900,12 @@ function Invoke-Step {
     # whatever SkipReason the caller already computed from config - either
     # way the step just ends up SKIPPED with a reason explaining why.
     $tagSkipReason = $null
-    if ($Tag.Count -gt 0) {
-        if ($script:OnlyTags.Count -gt 0 -and @($Tag | Where-Object { $_ -in $script:OnlyTags }).Count -eq 0) {
-            $tagSkipReason = "tag(s) '$($Tag -join ', ')' not included in -Only ($($script:OnlyTags -join ', '))"
+    if ($Tag.Count -gt 0 -and -not (Test-TagActive -Tag $Tag)) {
+        $tagSkipReason = if ($script:OnlyTags.Count -gt 0 -and @($Tag | Where-Object { $_ -in $script:OnlyTags }).Count -eq 0) {
+            "tag(s) '$($Tag -join ', ')' not included in -Only ($($script:OnlyTags -join ', '))"
         }
-        elseif ($script:SkipTags.Count -gt 0 -and @($Tag | Where-Object { $_ -in $script:SkipTags }).Count -gt 0) {
-            $tagSkipReason = "tag(s) '$($Tag -join ', ')' excluded via -Skip"
+        else {
+            "tag(s) '$($Tag -join ', ')' excluded via -Skip"
         }
     }
     $effectiveSkipReason = if ($tagSkipReason) {
@@ -2991,18 +3045,26 @@ Assert-ConfigNoConflicts -Config $Config -InstallPowershell7Config $installPower
 # already guarantees the two go together - but that list is written to grow,
 # and this check must not assume a bws-specific resolution path for some
 # future secret manager's ids.
+#
+# Also scoped to secrets actually reachable under this run's -Only/-Skip
+# selection (via Get-SecretFieldTags + Test-TagActive) - otherwise e.g.
+# -Only power would needlessly fail on an unrelated expired token for a
+# secret none of the selected steps would ever touch.
 if (-not $script:VerifyMode) {
     $secretManagerForPreflight = Get-ConfigValue $Config @('secret_manager')
-    $secretIdFieldsForPreflight = Find-ConfigSecretIdFields -Node $Config
-    if ($secretManagerForPreflight -eq 'bws' -and $secretIdFieldsForPreflight.Count -gt 0) {
-        Write-Host "Verifying Bitwarden Secrets Manager access ($($secretIdFieldsForPreflight.Count) secret(s) referenced in config)..." -ForegroundColor Cyan
-        try {
-            Get-BwsSecretValue -SecretId $secretIdFieldsForPreflight[0].Value | Out-Null
+    if ($secretManagerForPreflight -eq 'bws') {
+        $reachableSecretFieldsForPreflight = @(Find-ConfigSecretIdFields -Node $Config |
+            Where-Object { Test-TagActive -Tag (Get-SecretFieldTags -Path $_.Path) })
+        if ($reachableSecretFieldsForPreflight.Count -gt 0) {
+            Write-Host "Verifying Bitwarden Secrets Manager access ($($reachableSecretFieldsForPreflight.Count) secret(s) reachable by this run)..." -ForegroundColor Cyan
+            try {
+                Get-BwsSecretValue -SecretId $reachableSecretFieldsForPreflight[0].Value | Out-Null
+            }
+            catch {
+                throw "Bitwarden Secrets Manager access check failed before making any changes to this machine - $($_.Exception.Message) Verify `$env:BWS_ACCESS_TOKEN is correct, then re-run bootstrap."
+            }
+            Write-Host 'Bitwarden Secrets Manager access verified.' -ForegroundColor Cyan
         }
-        catch {
-            throw "Bitwarden Secrets Manager access check failed before making any changes to this machine - $($_.Exception.Message) Verify `$env:BWS_ACCESS_TOKEN is correct, then re-run bootstrap."
-        }
-        Write-Host 'Bitwarden Secrets Manager access verified.' -ForegroundColor Cyan
     }
 }
 
@@ -5413,10 +5475,17 @@ function Get-PowerSettingMinutes {
     # See the matching comment in Get-BwsSecretValue: 'Continue' is scoped to
     # this call so a stray stderr line from powercfg can't turn into a
     # terminating error under the script-wide $ErrorActionPreference = 'Stop'.
+    # That also means a real failure (bad SubGroup/Setting GUID, permission
+    # issue) would otherwise go unnoticed - the regexes below just wouldn't
+    # match and this would silently report both values as unset rather than
+    # as a failed query - so the exit code is still checked explicitly.
     $output = & {
         $ErrorActionPreference = 'Continue'
         powercfg /query SCHEME_CURRENT $SubGroup $Setting 2>&1
     } | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "powercfg /query $SubGroup $Setting failed (exit $LASTEXITCODE): $output"
+    }
     $acMatch = [regex]::Match($output, 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)')
     $dcMatch = [regex]::Match($output, 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)')
     [pscustomobject]@{
