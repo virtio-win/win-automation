@@ -4455,11 +4455,19 @@ $authorizedKeysSkip = if (-not $sshServerEnabled) {
     "'ssh_server.enable' is not set to true in config"
 }
 elseif ($authorizedKeys.Count -eq 0) {
-    'no ssh_server.authorized_keys configured (password authentication remains available)'
+    "no ssh_server.authorized_keys configured (password authentication remains available for '$env:USERNAME')"
 }
 else { $null }
 
-Invoke-Step -Name 'Configure SSH key-based login' -SkipReason $authorizedKeysSkip -Tag 'ssh' -Verify {
+# Named with $env:USERNAME, not a config value: this step is specifically
+# about granting key-based login to whichever account is running bootstrap
+# right now (e.g. a disposable 'template' account) via ssh_server.authorized_keys
+# - a different, independent mechanism from local_users[].ssh_keys further
+# below, which configures each named account the config creates. Easy to
+# conflate the two since both ultimately write an authorized_keys file -
+# confirmed live this naming was needed to make clear which account a given
+# run's skip/OK message is actually about.
+Invoke-Step -Name "Configure SSH key-based login for '$env:USERNAME'" -SkipReason $authorizedKeysSkip -Tag 'ssh' -Verify {
     $resolvedKeys = Resolve-SshKeyList -Keys $authorizedKeys
     $isAdminAccount = $null -ne (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like "*\$env:USERNAME" })
