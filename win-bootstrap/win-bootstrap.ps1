@@ -3053,7 +3053,15 @@ Assert-ConfigNoConflicts -Config $Config -InstallPowershell7Config $installPower
 if (-not $script:VerifyMode) {
     $secretManagerForPreflight = Get-ConfigValue $Config @('secret_manager')
     if ($secretManagerForPreflight -eq 'bws') {
-        $reachableSecretFieldsForPreflight = @(Find-ConfigSecretIdFields -Node $Config |
+        # Captured into a variable before piping, deliberately: piping
+        # Find-ConfigSecretIdFields's call directly into Where-Object instead
+        # bypasses its leading-comma return trick (see that function's
+        # comment) and hands Where-Object the whole array as a single $_,
+        # not one element at a time - confirmed live, $_.Path then becomes a
+        # multi-value array instead of a string and blows up the
+        # Get-SecretFieldTags call below.
+        $allSecretFieldsForPreflight = Find-ConfigSecretIdFields -Node $Config
+        $reachableSecretFieldsForPreflight = @($allSecretFieldsForPreflight |
             Where-Object { Test-TagActive -Tag (Get-SecretFieldTags -Path $_.Path) })
         if ($reachableSecretFieldsForPreflight.Count -gt 0) {
             Write-Host "Verifying Bitwarden Secrets Manager access ($($reachableSecretFieldsForPreflight.Count) secret(s) reachable by this run)..." -ForegroundColor Cyan
