@@ -2491,6 +2491,20 @@ function Test-WingetInstallSuccess {
     return $alreadyInstalledCodes -contains ($ExitCode -band 0xFFFFFFFF)
 }
 
+# Literal copy of win-bootstrap.ps1's own Test-WingetPackageInstalled (same
+# reason as the desktop-shortcut functions above: this runs standalone,
+# can't call back into the main script). Checked before every install below
+# - without this, a package already present with a DIFFERENT scope than
+# requested here (e.g. installed 'machine' by IT, requested 'user' for this
+# account) doesn't get recognized as "already installed" by winget itself,
+# and a second, genuinely separate per-user copy gets installed right next
+# to it - confirmed live with Bitwarden.
+function Test-WingetPackageInstalled {
+    param([Parameter(Mandatory)] [string]$Id)
+    & $wingetPath list -e --id $Id --source winget --accept-source-agreements | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
 function Wait-ForFirstLoginAcknowledgement {
     if ($Quiet -or -not [Environment]::UserInteractive -or $Host.Name -ne 'ConsoleHost') { return }
     try {
@@ -2594,8 +2608,13 @@ if (-not $wingetPath) {
 $allSucceeded = $true
 foreach ($app in $apps) {
     $id = $app.Id
-    Write-Host "Installing $id ..."
     try {
+        if (Test-WingetPackageInstalled -Id $id) {
+            Write-Host "'$id' is already installed (possibly under a different scope), skipping."
+            "$(Get-Date -Format o) - $id - already installed, skipped" | Out-File -FilePath $logPath -Append
+            continue
+        }
+        Write-Host "Installing $id ..."
         # This runs in the account's own real interactive session, so
         # 'Desktop'/'Programs' here resolve to ITS OWN folders (unlike the
         # shared all-users copy the main bootstrap run does for scope:
