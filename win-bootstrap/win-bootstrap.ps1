@@ -2419,10 +2419,14 @@ function Register-FirstLoginTask {
         Write-Host "First-login setup for '$UserName' already completed (marker file present), skipping."
         return
     }
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Write-Host "First-login setup task for '$UserName' is already scheduled, leaving it alone."
-        return
-    }
+    # Deliberately checked again further down, AFTER the script file is
+    # (re)written below - not here. An already-scheduled-but-not-yet-fired
+    # task still points at that same on-disk .ps1 file, so re-running
+    # bootstrap (e.g. to pick up a fix to the template itself) must refresh
+    # that file's content even when the task doesn't need to be re-created -
+    # otherwise a pending task keeps running whatever version of the script
+    # existed when it was first scheduled, silently missing later fixes.
+    $taskAlreadyExists = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
 
     if (-not (Test-Path $baseDir)) { New-Item -ItemType Directory -Path $baseDir -Force | Out-Null }
     $scriptPath = Join-Path $baseDir "first-login-$UserName.ps1"
@@ -2689,6 +2693,11 @@ Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
 '@
     $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__APPS__', $appsLiteral).Replace('__APP_IDS_DISPLAY__', $appIdsDisplay).Replace('__APP_COUNT__', $Apps.Count).Replace('__TASK_NAME__', $taskName)
     Set-Content -Path $scriptPath -Value $scriptContent
+
+    if ($taskAlreadyExists) {
+        Write-Host "First-login setup task for '$UserName' is already scheduled - refreshed its script to the current version."
+        return
+    }
 
     $actionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
     if ($Quiet) { $actionArguments += ' -Quiet' }
