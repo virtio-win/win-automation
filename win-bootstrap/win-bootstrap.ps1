@@ -2419,10 +2419,14 @@ function Register-FirstLoginTask {
         Write-Host "First-login setup for '$UserName' already completed (marker file present), skipping."
         return
     }
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Write-Host "First-login setup task for '$UserName' is already scheduled, leaving it alone."
-        return
-    }
+    # Deliberately checked again further down, AFTER the script file is
+    # (re)written below - not here. An already-scheduled-but-not-yet-fired
+    # task still points at that same on-disk .ps1 file, so re-running
+    # bootstrap (e.g. to pick up a fix to the template itself) must refresh
+    # that file's content even when the task doesn't need to be re-created -
+    # otherwise a pending task keeps running whatever version of the script
+    # existed when it was first scheduled, silently missing later fixes.
+    $taskAlreadyExists = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
 
     if (-not (Test-Path $baseDir)) { New-Item -ItemType Directory -Path $baseDir -Force | Out-Null }
     $scriptPath = Join-Path $baseDir "first-login-$UserName.ps1"
@@ -2489,6 +2493,20 @@ function Test-WingetInstallSuccess {
     if ($ExitCode -eq 0) { return $true }
     $alreadyInstalledCodes = @(0x8A15002B, 0x8A150061, 0x8A15010D, 0x8A15004F)
     return $alreadyInstalledCodes -contains ($ExitCode -band 0xFFFFFFFF)
+}
+
+# Literal copy of win-bootstrap.ps1's own Test-WingetPackageInstalled (same
+# reason as the desktop-shortcut functions above: this runs standalone,
+# can't call back into the main script). Checked before every install below
+# - without this, a package already present with a DIFFERENT scope than
+# requested here (e.g. installed 'machine' by IT, requested 'user' for this
+# account) doesn't get recognized as "already installed" by winget itself,
+# and a second, genuinely separate per-user copy gets installed right next
+# to it - confirmed live with Bitwarden.
+function Test-WingetPackageInstalled {
+    param([Parameter(Mandatory)] [string]$Id)
+    & $wingetPath list -e --id $Id --source winget --accept-source-agreements | Out-Null
+    return $LASTEXITCODE -eq 0
 }
 
 function Wait-ForFirstLoginAcknowledgement {
@@ -2594,8 +2612,13 @@ if (-not $wingetPath) {
 $allSucceeded = $true
 foreach ($app in $apps) {
     $id = $app.Id
-    Write-Host "Installing $id ..."
     try {
+        if (Test-WingetPackageInstalled -Id $id) {
+            Write-Host "'$id' is already installed (possibly under a different scope), skipping."
+            "$(Get-Date -Format o) - $id - already installed, skipped" | Out-File -FilePath $logPath -Append
+            continue
+        }
+        Write-Host "Installing $id ..."
         # This runs in the account's own real interactive session, so
         # 'Desktop'/'Programs' here resolve to ITS OWN folders (unlike the
         # shared all-users copy the main bootstrap run does for scope:
@@ -2670,6 +2693,11 @@ Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
 '@
     $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__APPS__', $appsLiteral).Replace('__APP_IDS_DISPLAY__', $appIdsDisplay).Replace('__APP_COUNT__', $Apps.Count).Replace('__TASK_NAME__', $taskName)
     Set-Content -Path $scriptPath -Value $scriptContent
+
+    if ($taskAlreadyExists) {
+        Write-Host "First-login setup task for '$UserName' is already scheduled - refreshed its script to the current version."
+        return
+    }
 
     $actionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
     if ($Quiet) { $actionArguments += ' -Quiet' }
