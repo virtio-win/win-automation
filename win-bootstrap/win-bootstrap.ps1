@@ -1815,8 +1815,15 @@ function Test-IsAdmin {
 # CIM at that point. Checked once near the top of a real run so later steps
 # that depend on CIM can skip cleanly instead of crashing.
 function Test-PendingComputerRename {
-    $active = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue).ComputerName
-    $pending = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue).ComputerName
+    # Property access (not just the Get-ItemProperty call itself) must be
+    # guarded: confirmed live, under this script's own Set-StrictMode
+    # -Version Latest, "$null.ComputerName" or a result missing that
+    # property throws PropertyNotFoundException instead of returning $null -
+    # which would otherwise crash this defensive check itself.
+    $activeKey = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue
+    $pendingKey = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue
+    $active = if ($activeKey -and $activeKey.PSObject.Properties['ComputerName']) { $activeKey.ComputerName } else { $null }
+    $pending = if ($pendingKey -and $pendingKey.PSObject.Properties['ComputerName']) { $pendingKey.ComputerName } else { $null }
     return [bool]($active -and $pending -and $active -ne $pending)
 }
 
@@ -4682,6 +4689,15 @@ Invoke-Step -Name 'Set computer name' -SkipReason $computerNameSkip -Tag 'comput
 
     Rename-Computer -NewName $desiredComputerName -Force
     $script:RebootRequired = $true
+    # Refreshed here, not just checked once at the top of the run: a rename
+    # made BY THIS RUN only becomes "pending" from this point onward, so a
+    # later CIM-dependent step (product key activation) needs to see it -
+    # the privacy-policy step already ran earlier in the sequence and isn't
+    # affected by a rename that hadn't happened yet.
+    $script:PendingComputerRename = Test-PendingComputerRename
+    if ($script:PendingComputerRename) {
+        Write-Warning 'A computer rename is now pending a reboot. The Windows product key activation step will be skipped this run - reboot, then re-run bootstrap to apply it.'
+    }
     Write-Host "Computer renamed from '$env:COMPUTERNAME' to '$desiredComputerName'; takes effect after reboot."
 }
 
