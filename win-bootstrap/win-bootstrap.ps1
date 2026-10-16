@@ -1806,6 +1806,27 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Rename-Computer below writes the new name here immediately, but WMI/CIM
+# and the rest of the running session keep using ActiveComputerName (the
+# name from THIS boot) until a reboot actually happens. Confirmed live: once
+# the two differ, Get-CimInstance can fail outright with "No mapping between
+# account names and security IDs was done" (HRESULT 0x80070534) - a classic
+# symptom of a pending rename, not a code bug in whatever happened to call
+# CIM at that point. Checked once near the top of a real run so later steps
+# that depend on CIM can skip cleanly instead of crashing.
+function Test-PendingComputerRename {
+    # Property access (not just the Get-ItemProperty call itself) must be
+    # guarded: confirmed live, under this script's own Set-StrictMode
+    # -Version Latest, "$null.ComputerName" or a result missing that
+    # property throws PropertyNotFoundException instead of returning $null -
+    # which would otherwise crash this defensive check itself.
+    $activeKey = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue
+    $pendingKey = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue
+    $active = if ($activeKey -and $activeKey.PSObject.Properties['ComputerName']) { $activeKey.ComputerName } else { $null }
+    $pending = if ($pendingKey -and $pendingKey.PSObject.Properties['ComputerName']) { $pendingKey.ComputerName } else { $null }
+    return [bool]($active -and $pending -and $active -ne $pending)
+}
+
 function Test-BitwardenInstalled {
     # Deliberately independent of whether this script's own winget step
     # installed Bitwarden — this must also detect a pre-existing install
@@ -3008,6 +3029,13 @@ if (-not $ValidateConfig -and -not $Verify) {
 $Arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
 Write-Host "Detected architecture: $Arch" -ForegroundColor Cyan
 
+# Computed once, here, rather than inline at each dependent step below - see
+# Test-PendingComputerRename's own comment for why this matters.
+$script:PendingComputerRename = Test-PendingComputerRename
+if ($script:PendingComputerRename) {
+    Write-Warning "A computer rename is pending a reboot. Steps that depend on WMI/CIM (privacy policy, product key activation) will be skipped this run rather than risk crashing on 'No mapping between account names and security IDs was done' - reboot, then re-run bootstrap to pick them up."
+}
+
 # ----------------------------------------------------------------------------
 # 3. Resolve, fetch, and parse the config
 # ----------------------------------------------------------------------------
@@ -3707,6 +3735,9 @@ $privacyMode = Get-ConfigValue $Config @('privacy')
 $script:StrictPrivacySupport = $null
 
 Invoke-Step -Name 'Apply strict Windows privacy policy' -SkipReason {
+    if ($script:PendingComputerRename) {
+        return 'a computer rename is pending a reboot - re-run after rebooting'
+    }
     $privacyConfigured = $Config -is [System.Collections.IDictionary] -and $Config.Contains('privacy')
     if (-not $privacyConfigured) {
         return "no 'privacy' mode configured"
@@ -4658,6 +4689,15 @@ Invoke-Step -Name 'Set computer name' -SkipReason $computerNameSkip -Tag 'comput
 
     Rename-Computer -NewName $desiredComputerName -Force
     $script:RebootRequired = $true
+    # Refreshed here, not just checked once at the top of the run: a rename
+    # made BY THIS RUN only becomes "pending" from this point onward, so a
+    # later CIM-dependent step (product key activation) needs to see it -
+    # the privacy-policy step already ran earlier in the sequence and isn't
+    # affected by a rename that hadn't happened yet.
+    $script:PendingComputerRename = Test-PendingComputerRename
+    if ($script:PendingComputerRename) {
+        Write-Warning 'A computer rename is now pending a reboot. The Windows product key activation step will be skipped this run - reboot, then re-run bootstrap to apply it.'
+    }
     Write-Host "Computer renamed from '$env:COMPUTERNAME' to '$desiredComputerName'; takes effect after reboot."
 }
 
@@ -5447,7 +5487,9 @@ $winKeyInline = Get-ConfigValue $Config @('windows_product_key')
 $winKeyPath = Get-ConfigValue $Config @('windows_product_key_path')
 $winKeyUrl = Get-ConfigValue $Config @('windows_product_key_url')
 $winKeySecretId = Get-ConfigValue $Config @('windows_product_key_secret_id')
-$winKeySkip = if (-not ($winKeyInline -or $winKeyPath -or $winKeyUrl -or $winKeySecretId)) {
+$winKeySkip = if ($script:PendingComputerRename) {
+    'a computer rename is pending a reboot - re-run after rebooting'
+} elseif (-not ($winKeyInline -or $winKeyPath -or $winKeyUrl -or $winKeySecretId)) {
     "no 'windows_product_key' configured"
 } else { $null }
 
