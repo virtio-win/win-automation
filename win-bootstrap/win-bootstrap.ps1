@@ -1101,7 +1101,7 @@ function Test-BootstrapConfig {
             }
             $timePeers = Get-ConfigValue $timeSync @('peers')
             if ($timePeers -isnot [array] -or $timePeers.Count -lt 1 -or $timePeers.Count -gt 8) {
-                $problems.Add('time_sync.peers must contain 1 to 8 DNS names or IPv4 addresses.')
+                $problems.Add('time_sync.peers must be a list containing 1 to 8 DNS names or IPv4 addresses.')
             }
             else {
                 $seenPeers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -5874,7 +5874,10 @@ function Get-TimeSyncState {
         return [pscustomobject]@{ Ok = $false; Detail = 'W32Time status query failed.' }
     }
 
-    if ($parameters.Type -ne 'NTP' -or $parameters.NtpServer -ne $desiredList) {
+    if ($null -eq $parameters.PSObject.Properties['Type'] -or
+        $parameters.Type -ne 'NTP' -or
+        $null -eq $parameters.PSObject.Properties['NtpServer'] -or
+        $parameters.NtpServer -ne $desiredList) {
         return [pscustomobject]@{ Ok = $false; Detail = 'W32Time manual peer configuration differs.' }
     }
     if (-not $sourceIsPeer) {
