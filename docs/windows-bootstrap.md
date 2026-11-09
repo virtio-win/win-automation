@@ -991,6 +991,32 @@ A map. Configures a static IP address (with subnet and default gateway), DNS ser
 - **`apply_after_reboot: false` (applies immediately)**: confirmation-gated
   the same way as [`recovery_partition`](#recovery_partition)'s delete - prompts for a literal `YES` unless `-Quiet` - warning explicitly that the current session may drop. Like [`delete_bootstrap_user`](#delete_bootstrap_user), the actual change is **deferred to the very end of the run** (after the final summary, and after even the bootstrap user deletion), so every other step's result is visible first.
 
+### `time_sync`
+
+```yaml
+time_sync:
+  peers:
+    - ntp1.example.org
+    - ntp2.example.org
+```
+
+Optional Windows Time client configuration. Supply one to eight reachable DNS
+names or IPv4 addresses; each peer is sent to W32Time with the client-mode
+`0x8` flag. Peer names cannot contain flags, ports, or whitespace. The engine
+sets the manual peer list and requests a W32Time resync. It fails the step if
+the resync fails or W32Time does not select one of the configured peers. No
+direct system-clock write is made. A large correction can still change the
+guest clock during bootstrap, so run this step before scheduling work that
+uses absolute guest deadlines.
+
+`-Verify` is read-only. It checks that W32Time is running, the configured
+manual peers match, the status query succeeds, and the current source is one
+of those peers. A retained peer list alone is insufficient: after a restore,
+W32Time can fall back to `Local CMOS Clock`. The profile does not configure an
+NTP server for other machines; operating one is a separate network decision.
+Keep organization-specific peer names in a target or private profile rather
+than a reusable golden-image profile.
+
 ### `delete_bootstrap_user`
 
 ```yaml

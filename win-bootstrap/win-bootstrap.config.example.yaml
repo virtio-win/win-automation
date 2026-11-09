@@ -714,6 +714,19 @@ power:
 #   apply_after_reboot: true
 
 # ----------------------------------------------------------------------------
+# time_sync
+# ----------------------------------------------------------------------------
+# Optional Windows Time client peers. Use reachable DNS names or IPv4
+# addresses from the target network. The engine appends the W32Time client
+# flag 0x8, configures manual peers, restarts W32Time, and requests a resync.
+# Do not put organization-specific names in a shared golden-image profile.
+# This step fails if W32Time does not select one of the configured peers.
+# time_sync:
+#   peers:
+#     - ntp1.example.org
+#     - ntp2.example.org
+
+# ----------------------------------------------------------------------------
 # delete_bootstrap_user
 # ----------------------------------------------------------------------------
 # Permanently deletes the local account that ran this script

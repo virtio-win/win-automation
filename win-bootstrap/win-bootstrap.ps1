@@ -412,7 +412,8 @@ $script:KnownStepTags = @(
     'teams', 'outlook', 'defender', 'uac', 'apps', 'powershell7',
     'windows_terminal', 'ssh', 'winssh_agent', 'computer_name', 'firewall',
     'smb', 'local_users', 'first_login', 'sudo', 'crash_dump',
-    'kernel_debugging', 'cleanup', 'product_key', 'power', 'network', 'privacy'
+    'kernel_debugging', 'cleanup', 'product_key', 'power', 'network', 'privacy',
+    'time_sync'
 )
 
 # A comma-separated -Only/-Skip value (e.g. "ssh,computer_name") only gets
@@ -939,6 +940,20 @@ function Test-BootstrapConfig {
         return $true
     }
 
+    function Test-TimePeerName {
+        param($Name)
+        if ($Name -isnot [string] -or $Name.Length -gt 253 -or $Name -notmatch '^[A-Za-z0-9.-]+$') {
+            return $false
+        }
+        if ($Name -match '^[0-9.]+$') { return Test-Ipv4Address $Name }
+        foreach ($label in ($Name -split '\.')) {
+            if ($label -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$') {
+                return $false
+            }
+        }
+        return $true
+    }
+
     if ($InstallPowershell7Config -eq $false -and $Powershell7Dependents.Count -gt 0) {
         $problems.Add("'install_powershell7' is set to false, but $($Powershell7Dependents -join ' and ') requires PowerShell 7 - remove the conflicting setting or set 'install_powershell7' to true.")
     }
@@ -1072,6 +1087,34 @@ function Test-BootstrapConfig {
     }
     foreach ($dnsEntry in $networkDns) {
         if (-not (Test-Ipv4Address $dnsEntry)) { $problems.Add("network.dns entry '$dnsEntry' is not a valid IPv4 address.") }
+    }
+
+    # time_sync: peer names are data, never caller-supplied w32tm flags.
+    $timeSync = Get-ConfigValue $Config @('time_sync')
+    if ($null -ne $timeSync) {
+        if ($timeSync -isnot [System.Collections.IDictionary]) {
+            $problems.Add('time_sync must be a map containing peers.')
+        }
+        else {
+            foreach ($key in $timeSync.Keys) {
+                if ($key -ne 'peers') { $problems.Add("time_sync.$key is not supported.") }
+            }
+            $timePeers = Get-ConfigValue $timeSync @('peers')
+            if ($timePeers -isnot [array] -or $timePeers.Count -lt 1 -or $timePeers.Count -gt 8) {
+                $problems.Add('time_sync.peers must contain 1 to 8 DNS names or IPv4 addresses.')
+            }
+            else {
+                $seenPeers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                for ($i = 0; $i -lt $timePeers.Count; $i++) {
+                    if (-not (Test-TimePeerName $timePeers[$i])) {
+                        $problems.Add("time_sync.peers[$i] must be a plain DNS name or IPv4 address without flags or whitespace.")
+                    }
+                    elseif (-not $seenPeers.Add($timePeers[$i])) {
+                        $problems.Add("time_sync.peers[$i] duplicates an earlier peer.")
+                    }
+                }
+            }
+        }
     }
     $networkMac = Get-ConfigValue $Config @('network', 'mac_address')
     if ($networkMac -and $networkMac -notmatch '^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$') {
@@ -5800,6 +5843,85 @@ Invoke-Step -Name 'Configure network settings' -SkipReason $networkSkip -Tag 'ne
             }
         }
     }
+}
+
+# ----------------------------------------------------------------------------
+# Windows Time client.  A selected manual peer is required in addition to the
+# configured registry values: a machine can retain an NtpServer entry while
+# falling back to Local CMOS Clock after a restore or a failed sync.
+# ----------------------------------------------------------------------------
+
+function Get-TimeSyncState {
+    param([Parameter(Mandatory)] [string[]]$Peers)
+
+    $desiredList = (@($Peers | ForEach-Object { "$_,0x8" }) -join ' ')
+    $parameters = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' -ErrorAction Stop
+    $service = Get-Service -Name w32time -ErrorAction Stop
+    if ($service.Status -ne 'Running') {
+        return [pscustomobject]@{ Ok = $false; Detail = 'W32Time is not running.' }
+    }
+
+    $sourceOutput = @(& w32tm.exe /query /source 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'W32Time source query failed.' }
+    }
+    $source = ($sourceOutput -join ' ').Trim()
+    $sourceName = $source -replace '(?i),0x[0-9a-f]+$', ''
+    $sourceIsPeer = @($Peers | Where-Object { $_ -eq $sourceName }).Count -gt 0
+
+    $statusOutput = @(& w32tm.exe /query /status 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $statusOutput.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'W32Time status query failed.' }
+    }
+
+    if ($parameters.Type -ne 'NTP' -or $parameters.NtpServer -ne $desiredList) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'W32Time manual peer configuration differs.' }
+    }
+    if (-not $sourceIsPeer) {
+        return [pscustomobject]@{ Ok = $false; Detail = 'W32Time has not selected a configured NTP peer.' }
+    }
+    return [pscustomobject]@{ Ok = $true; Detail = "W32Time is using configured peer '$sourceName'." }
+}
+
+$timeSyncPeers = Get-ConfigValue $Config @('time_sync', 'peers') @()
+$timeSyncSkip = if ($timeSyncPeers.Count -eq 0) { 'no time_sync.peers configured' } else { $null }
+
+Invoke-Step -Name 'Synchronize Windows Time with configured NTP peers' -SkipReason $timeSyncSkip -Tag 'time_sync' -Verify {
+    Get-TimeSyncState -Peers $timeSyncPeers
+} -Action {
+    $current = Get-TimeSyncState -Peers $timeSyncPeers
+    if ($current.Ok) {
+        Write-Host $current.Detail
+        return
+    }
+
+    $peerList = (@($timeSyncPeers | ForEach-Object { "$_,0x8" }) -join ' ')
+    $configOutput = @(& w32tm.exe /config "/manualpeerlist:$peerList" /syncfromflags:manual /update 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "W32Time refused the manual peer configuration: $($configOutput -join ' ')"
+    }
+
+    # Restart applies the new provider configuration.  No direct clock write
+    # is made; W32Time itself decides whether to accept a sample.
+    $service = Get-Service -Name w32time -ErrorAction Stop
+    if ($service.Status -eq 'Running') {
+        Restart-Service -Name w32time -Force -ErrorAction Stop
+    }
+    else {
+        Start-Service -Name w32time -ErrorAction Stop
+    }
+    $resyncOutput = @(& w32tm.exe /resync /rediscover 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "W32Time resync failed: $($resyncOutput -join ' ')"
+    }
+    $result = $null
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $result = Get-TimeSyncState -Peers $timeSyncPeers
+        if ($result.Ok) { break }
+        if ($attempt -lt 4) { Start-Sleep -Seconds 1 }
+    }
+    if (-not $result.Ok) { throw "W32Time resync did not select a configured peer: $($result.Detail)" }
+    Write-Host $result.Detail
 }
 
 # ----------------------------------------------------------------------------
