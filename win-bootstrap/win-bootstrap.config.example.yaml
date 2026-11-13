@@ -334,7 +334,21 @@ smb_shares:
 #                                        disables AutoAdminLogon, writing
 #                                        C:\ProgramData\win-bootstrap\autologon-once-<name>.done
 #                               always - keeps AutoLogon active across reboots
-#                               false  - leaves AutoLogon disabled
+#                               false  - skips the AutoLogon step and leaves
+#                                        any previously configured automatic
+#                                        logon and stored LSA DefaultPassword
+#                                        secret unchanged. To explicitly
+#                                        disable a previously configured
+#                                        AutoLogon and remove its stored
+#                                        password, set AutoAdminLogon="0" and
+#                                        remove DefaultPassword/AutoLogonCount
+#                                        (and optionally DefaultUserName)
+#                                        under HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon,
+#                                        and delete the DefaultPassword LSA
+#                                        secret via LsaStorePrivateData with a
+#                                        null value (also done automatically
+#                                        when delete_bootstrap_user: true
+#                                        deletes the current DefaultUserName).
 #                             At most one active local_users entry may set
 #                             autologon to once or always; cannot be combined
 #                             with generate: true or ask: true.

@@ -29,7 +29,7 @@ A generic, config-driven bootstrap engine for a freshly installed Windows machin
 - **Administrator privileges** for normal runs and `-Verify`. When started
   interactively without elevation, the script offers to relaunch itself through UAC. Under `-Quiet`, it fails immediately instead.
 - `-ValidateConfig` and `-ResolveSecretsTo` are the exceptions: static
-  configuration validation and host-side secret pre-resolution do not inspect or modify machine state and do not require elevation.
+  configuration validation and host-side secret pre-resolution do not apply provisioning steps and do not require elevation.
 
 ### Capabilities
 

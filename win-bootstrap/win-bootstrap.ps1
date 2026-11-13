@@ -150,8 +150,10 @@
     parses, and statically validates the config, resolves every secret
     from Bitwarden CLI (bw) and/or Bitwarden Secrets Manager (bws) into
     inline config fields, removes secret_manager, and writes the resulting
-    YAML to the specified file path with restricted ACLs (SYSTEM,
-    Administrators, and current user), then exits 0. Useful on a host
+    YAML to the specified file path with a restricted ACL granting
+    FullControl only to the current user (permissions must be explicitly
+    handed off before another account can read it), then exits 0. Does not
+    apply provisioning steps. Useful on a host
     machine to pre-resolve secrets into a temporary file before injecting
     it into an isolated guest VM. Mutually exclusive with -Verify,
     -ValidateConfig, -ShredConfig, -Only, and -Skip.
