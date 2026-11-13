@@ -432,7 +432,7 @@ $script:KnownStepTags = @(
     'windows_terminal', 'ssh', 'winssh_agent', 'computer_name', 'firewall',
     'smb', 'local_users', 'first_login', 'sudo', 'crash_dump',
     'kernel_debugging', 'cleanup', 'product_key', 'power', 'network', 'privacy',
-    'time_sync'
+    'time_sync', 'windows_update'
 )
 
 # A comma-separated -Only/-Skip value (e.g. "ssh,computer_name") only gets
@@ -533,6 +533,7 @@ $script:ValidArchitectures = @('arm64', 'x64')
 $script:ValidSecretManagers = @('bws')
 $script:ValidPrivacyModes = @('strict')
 $script:ValidAutologonModes = @('once', 'always', 'false')
+$script:ValidWindowsUpdateModes = @('auto', 'manual', 'pause', 'disable')
 
 function ConvertTo-AutologonMode {
     param($Value)
@@ -1143,6 +1144,12 @@ function Test-BootstrapConfig {
     Test-PowerTimeoutValue -Description 'power.sleep_after.on_battery' -Value (Get-ConfigValue $Config @('power', 'sleep_after', 'on_battery'))
     Test-PowerTimeoutValue -Description 'power.display_off_after.on_power' -Value (Get-ConfigValue $Config @('power', 'display_off_after', 'on_power'))
     Test-PowerTimeoutValue -Description 'power.display_off_after.on_battery' -Value (Get-ConfigValue $Config @('power', 'display_off_after', 'on_battery'))
+
+    # windows_update
+    $wuMode = Get-ConfigValue $Config @('windows_update', 'mode')
+    if ($wuMode -and $wuMode -notin $script:ValidWindowsUpdateModes) {
+        $problems.Add("windows_update.mode '$wuMode' is invalid - must be one of: $($script:ValidWindowsUpdateModes -join ', ').")
+    }
 
     # network
     $networkIp = Get-ConfigValue $Config @('network', 'ip')
@@ -6185,6 +6192,110 @@ Invoke-Step -Name 'Configure power display timeout' -SkipReason $displaySkip -Ta
     $powerDetail = if ($null -ne $displayOffAfterOnPower) { "$displayOffAfterOnPower min" } else { 'unchanged' }
     $batteryDetail = if ($null -ne $displayOffAfterOnBattery) { "$displayOffAfterOnBattery min" } else { 'unchanged' }
     Write-Host "Display timeout set (on power: $powerDetail, on battery: $batteryDetail)."
+}
+
+# ----------------------------------------------------------------------------
+# 31b. Configure Windows Update behavior (auto / manual / pause / disable)
+# ----------------------------------------------------------------------------
+
+$wuMode = Get-ConfigValue $Config @('windows_update', 'mode')
+$wuDisabled = Get-ConfigValue $Config @('windows_update', 'disabled') $false
+$wuSkip = if ($wuDisabled) {
+    "'windows_update.disabled' is set to true"
+} elseif (-not $wuMode) {
+    "no 'windows_update.mode' configured"
+} else { $null }
+
+Invoke-Step -Name 'Configure Windows Update behavior' -SkipReason $wuSkip -Tag 'windows_update' -Verify {
+    if ($wuMode -notin $script:ValidWindowsUpdateModes) {
+        throw "Invalid windows_update.mode '$wuMode' - must be one of: $($script:ValidWindowsUpdateModes -join ', ')."
+    }
+    $auKeyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    $uxKeyPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    $auProps = Get-ItemProperty -Path $auKeyPath -ErrorAction SilentlyContinue
+    $uxProps = Get-ItemProperty -Path $uxKeyPath -ErrorAction SilentlyContinue
+    $noAutoUpdate = if ($auProps -and $auProps.PSObject.Properties['NoAutoUpdate']) { [int]$auProps.NoAutoUpdate } else { $null }
+    $pauseExpiry = if ($uxProps -and $uxProps.PSObject.Properties['PauseUpdatesExpiryTime']) { [string]$uxProps.PauseUpdatesExpiryTime } else { $null }
+    $wuauserv = Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
+    $startType = if ($wuauserv) { [string]$wuauserv.StartType } else { 'Unknown' }
+
+    switch ($wuMode) {
+        'auto' {
+            $ok = ($null -eq $noAutoUpdate -or $noAutoUpdate -eq 0) -and (-not $pauseExpiry) -and ($startType -ne 'Disabled')
+            [pscustomobject]@{ Ok = $ok; Detail = "NoAutoUpdate=$noAutoUpdate, PauseUpdatesExpiryTime='$pauseExpiry', wuauserv.StartType=$startType (expected auto)" }
+        }
+        'manual' {
+            $ok = ($noAutoUpdate -eq 1) -and ($startType -ne 'Disabled')
+            [pscustomobject]@{ Ok = $ok; Detail = "NoAutoUpdate=$noAutoUpdate, wuauserv.StartType=$startType (expected NoAutoUpdate=1, service not Disabled)" }
+        }
+        'pause' {
+            $ok = ($noAutoUpdate -eq 1) -and ([bool]$pauseExpiry)
+            [pscustomobject]@{ Ok = $ok; Detail = "NoAutoUpdate=$noAutoUpdate, PauseUpdatesExpiryTime='$pauseExpiry' (expected NoAutoUpdate=1 and pause expiry set)" }
+        }
+        'disable' {
+            $ok = ($noAutoUpdate -eq 1) -and ($startType -eq 'Disabled')
+            [pscustomobject]@{ Ok = $ok; Detail = "NoAutoUpdate=$noAutoUpdate, wuauserv.StartType=$startType (expected NoAutoUpdate=1 and wuauserv Disabled)" }
+        }
+    }
+} -Action {
+    if ($wuMode -notin $script:ValidWindowsUpdateModes) {
+        throw "Invalid windows_update.mode '$wuMode' - must be one of: $($script:ValidWindowsUpdateModes -join ', ')."
+    }
+    $wuBaseKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auKeyPath = "$wuBaseKey\AU"
+    $uxKeyPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    if (-not (Test-Path $auKeyPath)) { New-Item -Path $auKeyPath -Force | Out-Null }
+    if (-not (Test-Path $uxKeyPath)) { New-Item -Path $uxKeyPath -Force | Out-Null }
+
+    $pauseKeys = @(
+        'PauseUpdatesExpiryTime',
+        'PauseFeatureUpdatesStartTime',
+        'PauseFeatureUpdatesEndTime',
+        'PauseQualityUpdatesStartTime',
+        'PauseQualityUpdatesEndTime',
+        'PauseUpdatesStartTime'
+    )
+
+    switch ($wuMode) {
+        'auto' {
+            Remove-ItemProperty -Path $auKeyPath -Name 'NoAutoUpdate' -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $auKeyPath -Name 'AUOptions' -ErrorAction SilentlyContinue
+            foreach ($pk in $pauseKeys) {
+                Remove-ItemProperty -Path $uxKeyPath -Name $pk -ErrorAction SilentlyContinue
+            }
+            Set-Service -Name 'wuauserv' -StartupType Manual -ErrorAction SilentlyContinue
+            Write-Host "Configured Windows Update mode 'auto' (automatic updates enabled)."
+        }
+        'manual' {
+            Set-ItemProperty -Path $auKeyPath -Name 'NoAutoUpdate' -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $auKeyPath -Name 'AUOptions' -Value 2 -Type DWord -Force
+            foreach ($pk in $pauseKeys) {
+                Remove-ItemProperty -Path $uxKeyPath -Name $pk -ErrorAction SilentlyContinue
+            }
+            Set-Service -Name 'wuauserv' -StartupType Manual -ErrorAction SilentlyContinue
+            Write-Host "Configured Windows Update mode 'manual' (NoAutoUpdate=1; background updates suppressed, manual check remains available)."
+        }
+        'pause' {
+            Set-ItemProperty -Path $auKeyPath -Name 'NoAutoUpdate' -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $auKeyPath -Name 'AUOptions' -Value 2 -Type DWord -Force
+            $startUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $endUtc = (Get-Date).ToUniversalTime().AddDays(35).ToString('yyyy-MM-ddTHH:mm:ssZ')
+            Set-ItemProperty -Path $uxKeyPath -Name 'PauseUpdatesStartTime' -Value $startUtc -Type String -Force
+            Set-ItemProperty -Path $uxKeyPath -Name 'PauseUpdatesExpiryTime' -Value $endUtc -Type String -Force
+            Set-ItemProperty -Path $uxKeyPath -Name 'PauseFeatureUpdatesStartTime' -Value $startUtc -Type String -Force
+            Set-ItemProperty -Path $uxKeyPath -Name 'PauseFeatureUpdatesEndTime' -Value $endUtc -Type String -Force
+            Set-ItemProperty -Path $uxKeyPath -Name 'PauseQualityUpdatesStartTime' -Value $startUtc -Type String -Force
+            Set-ItemProperty -Path $uxKeyPath -Name 'PauseQualityUpdatesEndTime' -Value $endUtc -Type String -Force
+            Set-Service -Name 'wuauserv' -StartupType Manual -ErrorAction SilentlyContinue
+            Write-Host "Configured Windows Update mode 'pause' (NoAutoUpdate=1 and updates paused until $endUtc)."
+        }
+        'disable' {
+            Set-ItemProperty -Path $auKeyPath -Name 'NoAutoUpdate' -Value 1 -Type DWord -Force
+            Stop-Service -Name 'wuauserv' -Force -ErrorAction SilentlyContinue
+            Set-Service -Name 'wuauserv' -StartupType Disabled -ErrorAction SilentlyContinue
+            Write-Host "Configured Windows Update mode 'disable' (NoAutoUpdate=1 and wuauserv service disabled)."
+        }
+    }
 }
 
 # ----------------------------------------------------------------------------
