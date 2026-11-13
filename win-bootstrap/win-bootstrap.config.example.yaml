@@ -310,6 +310,20 @@ smb_shares:
 #                             Set false to skip scheduling; this does not
 #                             remove an already-registered task. See apps
 #                             below for first-login option limitations.
+#   autologon               - optional, default false - configures Windows
+#                             AutoLogon for this account using encrypted LSA
+#                             Private Data (DefaultPassword), never plaintext
+#                             registry DefaultPassword:
+#                               once   - logs in automatically on the next
+#                                        boot, then a SYSTEM -AtLogOn task
+#                                        immediately wipes the LSA secret and
+#                                        disables AutoAdminLogon, writing
+#                                        C:\ProgramData\win-bootstrap\autologon-once-<name>.done
+#                               always - keeps AutoLogon active across reboots
+#                               false  - leaves AutoLogon disabled
+#                             At most one active local_users entry may set
+#                             autologon to once or always; cannot be combined
+#                             with generate: true or ask: true.
 #   disabled                - optional, default false - skip just this
 #                             entry, keeping it here for later (or use the
 #                             block-map form shown at the top of this file
@@ -344,6 +358,7 @@ local_users:
   - name: contractor
     generate: true
     admin: false
+    # autologon: once
     # disabled: true
     # ask: true
     # password: "REPLACE-WITH-AN-ACTUAL-STRONG-PASSWORD"

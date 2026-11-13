@@ -184,6 +184,22 @@
     changes, and a required reboot. If the script is not already running
     elevated, it exits with an error instead of prompting to relaunch.
 
+.PARAMETER ShredConfig
+    When the config is loaded from a local file (-ConfigPath,
+    BOOTSTRAP_CONFIG_PATH, or default win-bootstrap.config.yaml), securely
+    overwrites the file on disk with zero bytes, flushes it to physical
+    storage, and deletes it immediately after parsing and static validation
+    succeed (before any provisioning step runs). Useful when the config file
+    contains pre-resolved inline secrets injected by an external orchestrator.
+    Mutually exclusive with -ValidateConfig and -Verify.
+
+.PARAMETER NoReboot
+    Suppresses the automatic or prompted Restart-Computer at the end of a
+    real run when one or more steps set RebootRequired. When all steps succeed
+    and a reboot is required, the script exits with code 3010
+    (ERROR_SUCCESS_REBOOT_REQUIRED) so an external orchestrator can close its
+    session cleanly and trigger the reboot itself.
+
 .EXAMPLE
     .\win-bootstrap.ps1
     Resolves the config from environment variables or
@@ -244,7 +260,9 @@ param(
     [string[]]$Only = @(),
     [string[]]$Skip = @(),
     [Alias('q')]
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$ShredConfig,
+    [switch]$NoReboot
 )
 
 Set-StrictMode -Version Latest
@@ -276,6 +294,7 @@ $script:TranscriptActive = $false
 $script:TranscriptBaseDir = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) 'Logs\win-bootstrap'
 $script:TranscriptPath = $null
 $script:ConfigAuthOrigin = $null
+$script:ResolvedConfigSource = $null
 
 function Assert-NotReparsePoint {
     param([Parameter(Mandatory)] [string]$Path)
@@ -447,6 +466,12 @@ if ($ValidateConfig -and $Verify) {
 if ($ValidateConfig -and ($Only.Count -gt 0 -or $Skip.Count -gt 0)) {
     throw '-ValidateConfig always validates the whole config; it cannot be combined with -Only/-Skip.'
 }
+if ($ValidateConfig -and $ShredConfig) {
+    throw '-ValidateConfig and -ShredConfig are mutually exclusive; -ValidateConfig checks config syntax/values only and never deletes the config file.'
+}
+if ($Verify -and $ShredConfig) {
+    throw '-Verify and -ShredConfig are mutually exclusive; -Verify is read-only and never modifies or deletes files.'
+}
 foreach ($t in ($Only + $Skip)) {
     if ($t -notin $script:KnownStepTags) {
         throw "Unknown tag '$t' in -Only/-Skip. Valid tags: $($script:KnownStepTags -join ', ')"
@@ -507,6 +532,17 @@ $script:ValidAppScopes = @('machine', 'user')
 $script:ValidArchitectures = @('arm64', 'x64')
 $script:ValidSecretManagers = @('bws')
 $script:ValidPrivacyModes = @('strict')
+$script:ValidAutologonModes = @('once', 'always', 'false')
+
+function ConvertTo-AutologonMode {
+    param($Value)
+    if ($null -eq $Value) { return 'false' }
+    if ($Value -is [bool]) {
+        if (-not $Value) { return 'false' }
+        return 'true'
+    }
+    return ([string]$Value).Trim().ToLowerInvariant()
+}
 
 # ----------------------------------------------------------------------------
 # Minimal YAML parser - only supports the subset described in the header
@@ -1186,7 +1222,9 @@ function Test-BootstrapConfig {
     }
 
     # local_users
-    $localUsers = (Resolve-ConfigList -Config $Config -Key 'local_users').Items
+    $localUsersResolvedForValidation = Resolve-ConfigList -Config $Config -Key 'local_users'
+    $localUsers = $localUsersResolvedForValidation.Items
+    $activeAutologonUsers = [System.Collections.Generic.List[string]]::new()
     for ($i = 0; $i -lt $localUsers.Count; $i++) {
         $entry = $localUsers[$i]
         $name = Get-ConfigValue $entry @('name')
@@ -1200,10 +1238,26 @@ function Test-BootstrapConfig {
             generate            = Get-ConfigValue $entry @('generate') $false
             ask                 = Get-ConfigValue $entry @('ask') $false
         }
+        $autologonRaw = Get-ConfigValue $entry @('autologon') $false
+        $autologonMode = ConvertTo-AutologonMode $autologonRaw
+        if ($autologonMode -notin $script:ValidAutologonModes) {
+            $problems.Add("${label}: invalid 'autologon' '$autologonRaw' - must be one of: $($script:ValidAutologonModes -join ', ').")
+        }
+        elseif ($autologonMode -in @('once', 'always')) {
+            if ((Get-ConfigValue $entry @('generate') $false) -or (Get-ConfigValue $entry @('ask') $false)) {
+                $problems.Add("${label}: 'autologon: $autologonMode' cannot be combined with 'generate: true' or 'ask: true' (generated passwords, including the -Quiet fallback for ask, expire immediately and break Windows AutoLogon).")
+            }
+            if (-not $localUsersResolvedForValidation.Disabled -and -not (Get-ConfigValue $entry @('disabled') $false)) {
+                $activeAutologonUsers.Add($(if ($name) { $name } else { $label }))
+            }
+        }
         $sshKeys = Get-ConfigValue $entry @('ssh_keys')
         if ($sshKeys -and $sshKeys -ne 'default') {
             Test-SshKeyListShape -Description "${label}.ssh_keys" -Keys @($sshKeys)
         }
+    }
+    if ($activeAutologonUsers.Count -gt 1) {
+        $problems.Add("local_users: at most one active user may have 'autologon' set to 'once' or 'always' (found $($activeAutologonUsers.Count): $($activeAutologonUsers -join ', ')).")
     }
 
     # sudo
@@ -1563,6 +1617,7 @@ function Get-BootstrapConfigSourceText {
         [switch]$Quiet
     )
     $configSource = Resolve-ConfigSource -ConfigPath $ConfigPath -ConfigUrl $ConfigUrl
+    $script:ResolvedConfigSource = $configSource
     if ($configSource.Kind -eq 'Url') {
         $script:ConfigAuthOrigin = Get-UrlOrigin -Url $configSource.Value
     }
@@ -1598,6 +1653,34 @@ function Get-BootstrapConfigSourceText {
     }
 
     return $configText
+}
+
+function Remove-BootstrapFileSecurely {
+    param([Parameter(Mandatory)] [string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-NotReparsePoint -Path $Path
+    $item = Get-Item -LiteralPath $Path -Force
+    $fullPath = $item.FullName
+    $length = [int64]$item.Length
+    $fs = [System.IO.File]::Open($fullPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        if ($length -gt 0) {
+            $bufSize = [int][Math]::Min($length, 65536)
+            $zeros = New-Object byte[] $bufSize
+            $remaining = $length
+            while ($remaining -gt 0) {
+                $toWrite = [int][Math]::Min($remaining, $bufSize)
+                $fs.Write($zeros, 0, $toWrite)
+                $remaining -= $toWrite
+            }
+        }
+        $fs.Flush($true)
+    }
+    finally {
+        $fs.Dispose()
+    }
+    Remove-Item -LiteralPath $fullPath -Force
+    Write-Host "Securely shredded and deleted config file '$fullPath'." -ForegroundColor Cyan
 }
 
 function Resolve-ConfigResource {
@@ -2777,6 +2860,312 @@ Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
     Write-Host "Scheduled $($Apps.Count) scope:user app(s) to install for '$UserName' at their next interactive logon (log: $logPath)."
 }
 
+function Ensure-BootstrapLsaSecretType {
+    if ('WinBootstrap.LsaSecretHelper' -as [type]) { return }
+    $csharp = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace WinBootstrap
+{
+    public static class LsaSecretHelper
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_UNICODE_STRING
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_OBJECT_ATTRIBUTES
+        {
+            public int Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName;
+            public uint Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+
+        private const uint POLICY_CREATE_SECRET = 0x00000008;
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern uint LsaOpenPolicy(
+            IntPtr SystemName,
+            ref LSA_OBJECT_ATTRIBUTES ObjectAttributes,
+            uint DesiredAccess,
+            out IntPtr PolicyHandle);
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern uint LsaStorePrivateData(
+            IntPtr PolicyHandle,
+            ref LSA_UNICODE_STRING KeyName,
+            ref LSA_UNICODE_STRING PrivateData);
+
+        [DllImport("advapi32.dll", EntryPoint = "LsaStorePrivateData", SetLastError = false)]
+        private static extern uint LsaDeletePrivateData(
+            IntPtr PolicyHandle,
+            ref LSA_UNICODE_STRING KeyName,
+            IntPtr PrivateData);
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern uint LsaClose(IntPtr ObjectHandle);
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern int LsaNtStatusToWinError(uint Status);
+
+        public static void SetSecret(string secretName, string secretValue)
+        {
+            LSA_OBJECT_ATTRIBUTES attrs = new LSA_OBJECT_ATTRIBUTES();
+            attrs.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+            IntPtr policyHandle = IntPtr.Zero;
+            IntPtr keyBuffer = IntPtr.Zero;
+            IntPtr valBuffer = IntPtr.Zero;
+            int valByteLen = 0;
+
+            try
+            {
+                uint status = LsaOpenPolicy(IntPtr.Zero, ref attrs, POLICY_CREATE_SECRET, out policyHandle);
+                if (status != 0)
+                {
+                    throw new Win32Exception(LsaNtStatusToWinError(status), "LsaOpenPolicy failed.");
+                }
+
+                keyBuffer = Marshal.StringToHGlobalUni(secretName);
+                int keyByteLen = secretName.Length * 2;
+                LSA_UNICODE_STRING keyStr = new LSA_UNICODE_STRING
+                {
+                    Length = (ushort)keyByteLen,
+                    MaximumLength = (ushort)(keyByteLen + 2),
+                    Buffer = keyBuffer
+                };
+
+                if (secretValue == null)
+                {
+                    status = LsaDeletePrivateData(policyHandle, ref keyStr, IntPtr.Zero);
+                    if (status != 0 && status != 0xC0000034)
+                    {
+                        throw new Win32Exception(LsaNtStatusToWinError(status), "LsaStorePrivateData (delete) failed.");
+                    }
+                }
+                else
+                {
+                    valBuffer = Marshal.StringToHGlobalUni(secretValue);
+                    valByteLen = secretValue.Length * 2;
+                    LSA_UNICODE_STRING valStr = new LSA_UNICODE_STRING
+                    {
+                        Length = (ushort)valByteLen,
+                        MaximumLength = (ushort)(valByteLen + 2),
+                        Buffer = valBuffer
+                    };
+                    status = LsaStorePrivateData(policyHandle, ref keyStr, ref valStr);
+                    if (status != 0)
+                    {
+                        throw new Win32Exception(LsaNtStatusToWinError(status), "LsaStorePrivateData failed.");
+                    }
+                }
+            }
+            finally
+            {
+                if (valBuffer != IntPtr.Zero)
+                {
+                    for (int i = 0; i < valByteLen; i++)
+                    {
+                        Marshal.WriteByte(valBuffer, i, 0);
+                    }
+                    Marshal.FreeHGlobal(valBuffer);
+                }
+                if (keyBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(keyBuffer);
+                }
+                if (policyHandle != IntPtr.Zero)
+                {
+                    LsaClose(policyHandle);
+                }
+            }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $csharp -Language CSharp
+}
+
+function Set-WindowsAutoLogon {
+    param(
+        [Parameter(Mandatory)] [string]$UserName,
+        [Parameter(Mandatory)] [string]$PlainPassword
+    )
+    Ensure-BootstrapLsaSecretType
+    [WinBootstrap.LsaSecretHelper]::SetSecret('DefaultPassword', $PlainPassword)
+
+    $winlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Remove-ItemProperty -Path $winlogonPath -Name 'DefaultPassword' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $winlogonPath -Name 'AutoLogonCount' -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $winlogonPath -Name 'AutoAdminLogon' -Value '1' -Type String
+    Set-ItemProperty -Path $winlogonPath -Name 'DefaultUserName' -Value $UserName -Type String
+    Set-ItemProperty -Path $winlogonPath -Name 'DefaultDomainName' -Value $env:COMPUTERNAME -Type String
+}
+
+function Clear-WindowsAutoLogon {
+    param([switch]$RemoveDefaultUserName)
+    Ensure-BootstrapLsaSecretType
+    [WinBootstrap.LsaSecretHelper]::SetSecret('DefaultPassword', $null)
+
+    $winlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Set-ItemProperty -Path $winlogonPath -Name 'AutoAdminLogon' -Value '0' -Type String
+    Remove-ItemProperty -Path $winlogonPath -Name 'DefaultPassword' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $winlogonPath -Name 'AutoLogonCount' -ErrorAction SilentlyContinue
+    if ($RemoveDefaultUserName) {
+        Remove-ItemProperty -Path $winlogonPath -Name 'DefaultUserName' -ErrorAction SilentlyContinue
+    }
+}
+
+function Register-AutologonOnceCleanupTask {
+    param([Parameter(Mandatory)] [string]$UserName)
+    $taskName = "win-bootstrap-autologon-once-$UserName"
+    $baseDir = 'C:\ProgramData\win-bootstrap'
+    $markerPath = Join-Path $baseDir "autologon-once-$UserName.done"
+    if (-not (Test-Path $baseDir)) { New-Item -ItemType Directory -Path $baseDir -Force | Out-Null }
+    $scriptPath = Join-Path $baseDir "autologon-once-$UserName.ps1"
+    $logPath = Join-Path $baseDir "autologon-once-$UserName.log"
+
+    $template = @'
+$markerPath = '__MARKER_PATH__'
+if (Test-Path $markerPath) { exit }
+$logPath = '__LOG_PATH__'
+$taskName = '__TASK_NAME__'
+
+$csharp = @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace WinBootstrap
+{
+    public static class LsaSecretHelper
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_UNICODE_STRING
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_OBJECT_ATTRIBUTES
+        {
+            public int Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName;
+            public uint Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+
+        private const uint POLICY_CREATE_SECRET = 0x00000008;
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern uint LsaOpenPolicy(
+            IntPtr SystemName,
+            ref LSA_OBJECT_ATTRIBUTES ObjectAttributes,
+            uint DesiredAccess,
+            out IntPtr PolicyHandle);
+
+        [DllImport("advapi32.dll", EntryPoint = "LsaStorePrivateData", SetLastError = false)]
+        private static extern uint LsaDeletePrivateData(
+            IntPtr PolicyHandle,
+            ref LSA_UNICODE_STRING KeyName,
+            IntPtr PrivateData);
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern uint LsaClose(IntPtr ObjectHandle);
+
+        [DllImport("advapi32.dll", SetLastError = false)]
+        private static extern int LsaNtStatusToWinError(uint Status);
+
+        public static void ClearSecret(string secretName)
+        {
+            LSA_OBJECT_ATTRIBUTES attrs = new LSA_OBJECT_ATTRIBUTES();
+            attrs.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+            IntPtr policyHandle = IntPtr.Zero;
+            IntPtr keyBuffer = IntPtr.Zero;
+
+            try
+            {
+                uint status = LsaOpenPolicy(IntPtr.Zero, ref attrs, POLICY_CREATE_SECRET, out policyHandle);
+                if (status != 0)
+                {
+                    throw new Win32Exception(LsaNtStatusToWinError(status), "LsaOpenPolicy failed.");
+                }
+
+                keyBuffer = Marshal.StringToHGlobalUni(secretName);
+                int keyByteLen = secretName.Length * 2;
+                LSA_UNICODE_STRING keyStr = new LSA_UNICODE_STRING
+                {
+                    Length = (ushort)keyByteLen,
+                    MaximumLength = (ushort)(keyByteLen + 2),
+                    Buffer = keyBuffer
+                };
+
+                status = LsaDeletePrivateData(policyHandle, ref keyStr, IntPtr.Zero);
+                if (status != 0 && status != 0xC0000034)
+                {
+                    throw new Win32Exception(LsaNtStatusToWinError(status), "LsaStorePrivateData (delete) failed.");
+                }
+            }
+            finally
+            {
+                if (keyBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(keyBuffer);
+                }
+                if (policyHandle != IntPtr.Zero)
+                {
+                    LsaClose(policyHandle);
+                }
+            }
+        }
+    }
+}
+"@
+
+try {
+    if (-not ('WinBootstrap.LsaSecretHelper' -as [type])) {
+        Add-Type -TypeDefinition $csharp -Language CSharp
+    }
+    [WinBootstrap.LsaSecretHelper]::ClearSecret('DefaultPassword')
+
+    $winlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Set-ItemProperty -Path $winlogonPath -Name 'AutoAdminLogon' -Value '0' -Type String
+    Remove-ItemProperty -Path $winlogonPath -Name 'DefaultPassword' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $winlogonPath -Name 'AutoLogonCount' -ErrorAction SilentlyContinue
+
+    "$(Get-Date -Format o) - Wiped LSA DefaultPassword and disabled AutoAdminLogon after one-time logon." | Out-File -FilePath $logPath -Append
+    New-Item -ItemType File -Path $markerPath -Force | Out-Null
+    schtasks.exe /Delete /F /TN $taskName | Out-Null
+    Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+catch {
+    "$(Get-Date -Format o) - ERROR wiping AutoLogon credentials: $($_.Exception.Message)" | Out-File -FilePath $logPath -Append
+    exit 1
+}
+'@
+    $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__TASK_NAME__', $taskName)
+    Set-Content -Path $scriptPath -Value $scriptContent
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserName
+    $trigger.Delay = 'PT5S'
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+    Write-Host "Scheduled one-time AutoLogon credential wipe for '$UserName' at their first logon (log: $logPath)."
+}
+
 function Register-ProfileCleanupTask {
     # Remove-LocalUser (called on the account currently running this very
     # script, right at the end - see 'Delete bootstrap user account')
@@ -2832,30 +3221,49 @@ function Register-ProfileCleanupTask {
     # release, so leaving the task in place (not self-deleting) lets it
     # keep retrying on every subsequent boot until it actually succeeds,
     # rather than silently giving up after one failed attempt.
+    # Also removes the SAM user account itself if Remove-LocalUser could
+    # not complete during the live session (e.g. when the disposable
+    # template account had an active desktop session from AutoLogon).
     $template = @'
 $markerPath = '__MARKER_PATH__'
 if (Test-Path $markerPath) { exit }
 $logPath = '__LOG_PATH__'
+$userName = '__USER_NAME__'
 $sid = '__SID__'
 $taskName = '__TASK_NAME__'
 
 $maxAttempts = 5
 $deleted = $false
 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    $existingUser = Get-LocalUser -SID $sid -ErrorAction SilentlyContinue
+    if ($existingUser) {
+        try {
+            Remove-LocalUser -SID $sid -ErrorAction Stop
+            "$(Get-Date -Format o) - local user '$userName' (SID $sid) deleted at startup" | Out-File -FilePath $logPath -Append
+            $existingUser = $null
+        } catch {
+            "$(Get-Date -Format o) - attempt $attempt/$maxAttempts - Remove-LocalUser '$userName' (SID $sid) failed: $($_.Exception.Message)" | Out-File -FilePath $logPath -Append
+        }
+    }
+
     $targetProfile = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $sid }
     if (-not $targetProfile) {
         "$(Get-Date -Format o) - no profile found for SID $sid (already removed)" | Out-File -FilePath $logPath -Append
-        $deleted = $true
-        break
+        if (-not $existingUser) {
+            $deleted = $true
+            break
+        }
     }
-    if ($targetProfile.Loaded) {
+    elseif ($targetProfile.Loaded) {
         "$(Get-Date -Format o) - attempt $attempt/$maxAttempts - profile still loaded, waiting" | Out-File -FilePath $logPath -Append
     } else {
         try {
             Remove-CimInstance -InputObject $targetProfile -ErrorAction Stop
             "$(Get-Date -Format o) - profile for SID $sid deleted" | Out-File -FilePath $logPath -Append
-            $deleted = $true
-            break
+            if (-not $existingUser) {
+                $deleted = $true
+                break
+            }
         } catch {
             "$(Get-Date -Format o) - attempt $attempt/$maxAttempts - Remove-CimInstance failed: $($_.Exception.Message)" | Out-File -FilePath $logPath -Append
         }
@@ -2871,12 +3279,12 @@ if ($deleted) {
     "$(Get-Date -Format o) - giving up for now, will retry on next boot" | Out-File -FilePath $logPath -Append
 }
 '@
-    $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__SID__', $Sid).Replace('__TASK_NAME__', $taskName)
+    $scriptContent = $template.Replace('__MARKER_PATH__', $markerPath).Replace('__LOG_PATH__', $logPath).Replace('__USER_NAME__', $UserName).Replace('__SID__', $Sid).Replace('__TASK_NAME__', $taskName)
     Set-Content -Path $scriptPath -Value $scriptContent
 
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
     $trigger = New-ScheduledTaskTrigger -AtStartup
-    $trigger.Delay = 'PT30S'
+    $trigger.Delay = 'PT5S'
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
     Write-Host "Scheduled full profile cleanup for '$UserName' at next reboot (log: $logPath)."
@@ -3054,6 +3462,8 @@ if (-not (Test-IsAdmin)) {
     if ($Verify) { $scriptArgs += '-Verify' }
     if ($Download) { $scriptArgs += '-Download' }
     if ($Quiet) { $scriptArgs += '-Quiet' }
+    if ($ShredConfig) { $scriptArgs += '-ShredConfig' }
+    if ($NoReboot) { $scriptArgs += '-NoReboot' }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $scriptArgs -Verb RunAs
     exit 0
 }
@@ -3141,6 +3551,15 @@ if ($windowsTerminalWantsPowershell7) { $powershell7Dependents += 'windows_termi
 if ($sshWantsPowershell7) { $powershell7Dependents += 'ssh_server.default_shell: pwsh7' }
 
 Assert-ConfigNoConflicts -Config $Config -InstallPowershell7Config $installPowershell7Config -Powershell7Dependents $powershell7Dependents
+
+if ($ShredConfig) {
+    if ($script:ResolvedConfigSource -and $script:ResolvedConfigSource.Kind -eq 'Path') {
+        Remove-BootstrapFileSecurely -Path $script:ResolvedConfigSource.Value
+    }
+    else {
+        Write-Warning "-ShredConfig has no effect when config is loaded from a URL ($($script:ResolvedConfigSource.Value))."
+    }
+}
 
 # Pre-flight: verify Bitwarden Secrets Manager access actually works, if the
 # config uses it, before any system-modifying step below runs. Config
@@ -3234,8 +3653,10 @@ if ($localUsers.Count -eq 0) {
 else {
     foreach ($entry in $localUsers) {
         # Reset per-iteration so a previous user's password can never be
-        # mistaken for this one's by the profile-initialization step below.
+        # mistaken for this one's by the profile-initialization or autologon
+        # step below.
         $script:LastCreatedUserPassword = $null
+        $script:LastCreatedUserPlainPassword = $null
 
         $userName = Get-ConfigValue $entry @('name')
         $isAdmin = Get-ConfigValue $entry @('admin') $false
@@ -3326,8 +3747,9 @@ else {
                 New-LocalUser -Name $userName -Password $secure -PasswordNeverExpires:$passwordNeverExpires | Out-Null
                 Write-Host "Created local user '$userName'."
                 # Known-current password, available to the profile-initialization
-                # step right below for this same user (this run only).
+                # and autologon steps right below for this same user (this run only).
                 $script:LastCreatedUserPassword = $secure
+                $script:LastCreatedUserPlainPassword = $plainPassword
 
                 if ($wasGenerated) {
                     # Forces a password change at next interactive logon - New-LocalUser/
@@ -3409,6 +3831,78 @@ else {
                 Write-Warning "local_users '$userName': attempted to force-initialize its profile via a one-shot scheduled task, but it still doesn't exist afterward. Log on once manually and re-run bootstrap."
             }
         }
+
+        $autologonMode = ConvertTo-AutologonMode (Get-ConfigValue $entry @('autologon') $false)
+        $autologonSkip = if ($localUsersDisabled) {
+            "'local_users.disabled' is set to true"
+        } elseif ($userDisabled) {
+            "'disabled: true' for user '$userName'"
+        } elseif ($autologonMode -eq 'false') {
+            "autologon is not enabled for user '$userName'"
+        } else { $null }
+
+        Invoke-Step -Name "Configure AutoLogon for local user '$userName'" -SkipReason $autologonSkip -Tag 'local_users' -Verify {
+            $winlogon = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+            $autoAdmin = if ($winlogon -and $winlogon.PSObject.Properties['AutoAdminLogon']) { [string]$winlogon.AutoAdminLogon } else { $null }
+            $defaultUser = if ($winlogon -and $winlogon.PSObject.Properties['DefaultUserName']) { [string]$winlogon.DefaultUserName } else { $null }
+            $hasPlainDefaultPassword = [bool]($winlogon -and $winlogon.PSObject.Properties['DefaultPassword'])
+            if ($autologonMode -eq 'once') {
+                $markerPath = "C:\ProgramData\win-bootstrap\autologon-once-$userName.done"
+                $taskName = "win-bootstrap-autologon-once-$userName"
+                $taskExists = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
+                if (Test-Path $markerPath) {
+                    $ok = ($autoAdmin -ne '1') -and (-not $hasPlainDefaultPassword)
+                    [pscustomobject]@{ Ok = $ok; Detail = "one-time AutoLogon marker present; AutoAdminLogon='$autoAdmin'; plaintext DefaultPassword present: $hasPlainDefaultPassword" }
+                }
+                else {
+                    $ok = ($autoAdmin -eq '1') -and ($defaultUser -eq $userName) -and $taskExists -and (-not $hasPlainDefaultPassword)
+                    [pscustomobject]@{ Ok = $ok; Detail = "AutoAdminLogon='$autoAdmin', DefaultUserName='$defaultUser', cleanup task scheduled: $taskExists, plaintext DefaultPassword present: $hasPlainDefaultPassword" }
+                }
+            }
+            else {
+                $ok = ($autoAdmin -eq '1') -and ($defaultUser -eq $userName) -and (-not $hasPlainDefaultPassword)
+                [pscustomobject]@{ Ok = $ok; Detail = "AutoAdminLogon='$autoAdmin', DefaultUserName='$defaultUser', plaintext DefaultPassword present: $hasPlainDefaultPassword" }
+            }
+        } -Action {
+            if ($autologonMode -notin @('once', 'always')) {
+                throw "local_users '$userName': invalid autologon mode '$autologonMode'."
+            }
+            $markerPath = "C:\ProgramData\win-bootstrap\autologon-once-$userName.done"
+            if ($autologonMode -eq 'once' -and (Test-Path $markerPath)) {
+                Write-Host "One-time AutoLogon for '$userName' already completed (marker file present), skipping."
+                return
+            }
+
+            $autologonPassword = $script:LastCreatedUserPlainPassword
+            if (-not $autologonPassword) {
+                $inlinePassword = Get-ConfigValue $entry @('password')
+                $passwordPath = Get-ConfigValue $entry @('password_path')
+                $passwordUrl = Get-ConfigValue $entry @('password_url')
+                $passwordSecretId = Get-ConfigValue $entry @('password_secret_id')
+                if ($inlinePassword -or $passwordPath -or $passwordUrl -or $passwordSecretId) {
+                    $autologonPassword = Resolve-ConfigResource -InlineValue $inlinePassword -PathValue $passwordPath `
+                        -UrlValue $passwordUrl -SecretIdValue $passwordSecretId -Description "local_users '$userName' autologon password"
+                }
+            }
+            if (-not $autologonPassword) {
+                throw "local_users '$userName': cannot configure AutoLogon ($autologonMode) because the account already existed and no non-interactive password source is available."
+            }
+
+            Set-WindowsAutoLogon -UserName $userName -PlainPassword $autologonPassword
+            if ($autologonMode -eq 'once') {
+                Register-AutologonOnceCleanupTask -UserName $userName
+                Write-Host "Configured one-time AutoLogon (LSA Secret) for '$userName'."
+                $script:RebootRequired = $true
+            }
+            else {
+                Write-Host "Configured persistent AutoLogon (LSA Secret) for '$userName'."
+                if ($env:USERNAME -ne $userName) {
+                    $script:RebootRequired = $true
+                }
+            }
+        }
+
+        $script:LastCreatedUserPlainPassword = $null
     }
 }
 
@@ -5167,11 +5661,9 @@ else {
         $userName = Get-ConfigValue $entry @('name')
         $userDisabled = Get-ConfigValue $entry @('disabled') $false
         $completeSetupOnFirstLogin = Get-ConfigValue $entry @('complete_setup_on_first_login') $true
-        $userScopeAppsForLogin = if ($appsDisabled) {
-            @()
-        }
-        else {
-            @($apps | Where-Object {
+        $userScopeAppsForLogin = @()
+        if (-not $appsDisabled) {
+            $userScopeAppsForLogin = @($apps | Where-Object {
                 (Get-ConfigValue $_ @('scope') 'machine') -eq 'user' -and -not (Get-ConfigValue $_ @('disabled') $false)
             } | ForEach-Object {
                 [pscustomobject]@{
@@ -6211,6 +6703,23 @@ else {
     # account" above for why (the account/session running this script may
     # not survive it).
     if ($script:BootstrapUserToDelete) {
+        # If Winlogon DefaultUserName still points at the disposable bootstrap
+        # account being deleted (i.e. no local_users entry replaced it with its
+        # own autologon), wipe Winlogon AutoLogon and the LSA DefaultPassword
+        # secret so Windows never attempts to auto-logon into the deleted account.
+        $winlogonKey = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+        $currentDefaultUser = if ($winlogonKey -and $winlogonKey.PSObject.Properties['DefaultUserName']) { [string]$winlogonKey.DefaultUserName } else { $null }
+        if ($currentDefaultUser -and $currentDefaultUser -ieq $script:BootstrapUserToDelete) {
+            try {
+                Clear-WindowsAutoLogon -RemoveDefaultUserName
+                Write-Host "Cleared Winlogon AutoLogon settings for deleted bootstrap user '$script:BootstrapUserToDelete'."
+            }
+            catch {
+                $script:BootstrapExitCode = 1
+                Write-Warning "Could not clear Winlogon AutoLogon settings for '$script:BootstrapUserToDelete': $($_.Exception.Message)"
+            }
+        }
+
         # Captured before deletion - Get-LocalUser can't find the SID
         # once the account is gone, and Win32_UserProfile matches by SID.
         $bootstrapUserSid = (Get-LocalUser -Name $script:BootstrapUserToDelete -ErrorAction SilentlyContinue).SID.Value
@@ -6222,9 +6731,11 @@ else {
         # script is still running as the account being deleted), which
         # breaks the instant that account no longer exists in the SAM
         # database, even though the process/session itself lives on.
+        $profileCleanupScheduled = $false
         if ($bootstrapUserSid) {
             try {
                 Register-ProfileCleanupTask -UserName $script:BootstrapUserToDelete -Sid $bootstrapUserSid
+                $profileCleanupScheduled = $true
             }
             catch {
                 $script:BootstrapExitCode = 1
@@ -6237,8 +6748,14 @@ else {
             Write-Host "Deleted user account '$script:BootstrapUserToDelete'."
         }
         catch {
-            $script:BootstrapExitCode = 1
-            Write-Warning "Could not delete user account '$script:BootstrapUserToDelete' (it may have an active logon session): $($_.Exception.Message). Reboot and re-run this script (it's idempotent) to complete the cleanup."
+            if ($profileCleanupScheduled) {
+                $script:RebootRequired = $true
+                Write-Warning "Could not delete user account '$script:BootstrapUserToDelete' immediately (it may have an active desktop logon session: $($_.Exception.Message)) - deferred SAM account and profile removal to the scheduled startup task at next reboot."
+            }
+            else {
+                $script:BootstrapExitCode = 1
+                Write-Warning "Could not delete user account '$script:BootstrapUserToDelete' (it may have an active logon session): $($_.Exception.Message). Reboot and re-run this script (it's idempotent) to complete the cleanup."
+            }
         }
     }
 
@@ -6266,22 +6783,33 @@ else {
     # since this can end the current session just like recovery_partition's
     # delete or delete_bootstrap_user's deletion above.
     if ($script:RebootRequired) {
-        $rebootNow = Confirm-RiskyAction -Message 'One or more changes above need a reboot to fully take effect. Reboot now? This will end this session if connected remotely (e.g. SSH/RDP).'
-        if ($rebootNow) {
-            Write-Host 'Rebooting now...' -ForegroundColor Yellow
-            Restart-Computer -Force
-        } else {
-            Write-Host 'Reboot skipped - remember to reboot manually later to apply the pending change(s).'
+        if ($NoReboot) {
+            Write-Host 'Reboot required, but suppressed by -NoReboot (exiting with code 3010 if all steps succeeded).' -ForegroundColor Yellow
+            if ($script:BootstrapExitCode -eq 0) {
+                $script:BootstrapExitCode = 3010
+            }
+        }
+        else {
+            $rebootNow = Confirm-RiskyAction -Message 'One or more changes above need a reboot to fully take effect. Reboot now? This will end this session if connected remotely (e.g. SSH/RDP).'
+            if ($rebootNow) {
+                Write-Host 'Rebooting now...' -ForegroundColor Yellow
+                Stop-BootstrapTranscript
+                Restart-Computer -Force
+            } else {
+                Write-Host 'Reboot skipped - remember to reboot manually later to apply the pending change(s).'
+            }
         }
     }
 
-    if ($script:BootstrapExitCode -eq 0) {
+    if ($script:BootstrapExitCode -eq 0 -or $script:BootstrapExitCode -eq 3010) {
         Write-Host 'Bootstrap complete. Run this script again at any time to verify everything is still correctly applied (already-satisfied steps report OK without making changes), or use -Verify for a read-only check that never makes changes.' -ForegroundColor Green
     }
     else {
         Write-Warning 'Bootstrap completed with one or more failures. Review the summary and warnings above; the process will return a nonzero exit code.'
     }
 }
+
+Stop-BootstrapTranscript
 
 # Keep the process status meaningful to win-bootstrap.cmd, scheduled callers,
 # and other automation even though every independent step was allowed to run.
