@@ -28,8 +28,8 @@ A generic, config-driven bootstrap engine for a freshly installed Windows machin
 - **PowerShell 5.1** (built into supported Windows releases).
 - **Administrator privileges** for normal runs and `-Verify`. When started
   interactively without elevation, the script offers to relaunch itself through UAC. Under `-Quiet`, it fails immediately instead.
-- `-ValidateConfig` is the exception: this static configuration check does
-  not inspect or modify the machine and does not require elevation.
+- `-ValidateConfig` and `-ResolveSecretsTo` are the exceptions: static
+  configuration validation and host-side secret pre-resolution do not inspect or modify machine state and do not require elevation.
 
 ### Capabilities
 
@@ -44,7 +44,7 @@ It can, among other things:
 - Manage selected Windows security, network, recovery, and power settings.
 - And more — every capability is opt-in per config section.
 
-Real secrets (certificates, private keys, passwords) can be sourced from **Bitwarden Secrets Manager** instead of ever being written into the config file.
+Real secrets (certificates, private keys, passwords, product keys) can be sourced from **Bitwarden Secrets Manager (`bws`)** or **Bitwarden Password Manager CLI (`bw`)** instead of ever being written into the config file.
 
 See [`docs/windows-bootstrap.md`](docs/windows-bootstrap.md) for the full reference — start with its TL;DR section for the fastest path to a working config.
 

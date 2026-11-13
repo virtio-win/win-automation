@@ -57,9 +57,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 `
 
 Use `-ConfigCaPath C:\path\to\corporate-root-ca.pem` when the certificate is already on the machine. `-ConfigUrlInsecureSkipCertCheck` exists only as a last resort for a config URL that is already trusted by another channel; it disables validation for that one fetch. See [Certificate trust for the config fetch itself](#certificate-trust-for-the-config-fetch-itself).
 
-### 4. Bitwarden Secrets Manager for values inside the config
+### 4. Bitwarden (`bws` or `bw`) for values inside the config
 
-Use `_secret_id` fields when the config must refer to passwords, private keys, certificates, or kernel-debugging keys without containing their values. This config can be stored in source control because the password remains in Bitwarden:
+Use `_secret` (or legacy `_secret_id`) fields when the config must refer to passwords, private keys, certificates, product keys, or kernel-debugging keys without containing their values. This config can be stored in source control because the secret values remain in Bitwarden (**Bitwarden Secrets Manager** via `bws` or **Bitwarden Password Manager** via `bw`):
+
+```powershell
+@'
+secret_manager: bw
+local_users:
+  - name: builduser
+    password_secret:
+      path: Lab/builduser
+      field: password
+    admin: true
+    initialize_profile: false
+    complete_setup_on_first_login: false
+'@ | Set-Content .\win-bootstrap.config.yaml
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml
+```
+
+Or with Bitwarden Secrets Manager (`bws`):
 
 ```powershell
 @'
@@ -76,9 +94,9 @@ $env:BWS_ACCESS_TOKEN = '<bitwarden-machine-access-token>'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win-bootstrap.ps1 -ConfigPath .\win-bootstrap.config.yaml
 ```
 
-`BWS_ACCESS_TOKEN` is a Bitwarden Secrets Manager *machine access token*, not a Bitwarden vault password. Supply it through CI/provisioning secret injection when possible; an interactive literal assignment can be stored in shell history. The script installs and checksum-verifies `bws.exe` on first real use. See [Bitwarden Secrets Manager](#bitwarden-secrets-manager) for requirements and all supported secret fields.
+For `bws`, `BWS_ACCESS_TOKEN` is a Bitwarden Secrets Manager *machine access token*, and the script installs and checksum-verifies `bws.exe` on first real use. For `bw`, the script uses `bw.exe` (`Bitwarden.CLI`) on `PATH`, unlocking or logging in interactively when needed and locking the vault again when the run finishes. To pre-resolve secrets on a host machine into a temporary YAML file without elevation before copying it into an isolated VM, run with `-ResolveSecretsTo <output-path>`. See [Bitwarden Secrets Manager (`bws`)](#bitwarden-secrets-manager) and [Bitwarden Password Manager CLI (`bw`)](#bitwarden-password-manager-cli-bw) for requirements and all supported secret fields.
 
-The private config token and `BWS_ACCESS_TOKEN` are independent: the first authorizes downloading the configuration; the second authorizes resolving the `_secret_id` values named by that configuration. A deployment may use either, both, or neither.
+The private config token (`BOOTSTRAP_CONFIG_TOKEN`) and Bitwarden credentials (`BWS_ACCESS_TOKEN` / `BW_SESSION`) are independent: the first authorizes downloading the configuration; the second authorizes resolving the secrets named by that configuration. A deployment may use either, both, or neither.
 
 ## Table of Contents
 
@@ -95,6 +113,7 @@ The private config token and `BWS_ACCESS_TOKEN` are independent: the first autho
   - [SSH public key lists](#ssh-public-key-lists)
   - [On-machine generation](#on-machine-generation)
   - [Bitwarden Secrets Manager](#bitwarden-secrets-manager)
+  - [Bitwarden Password Manager CLI (`bw`)](#bitwarden-password-manager-cli-bw)
 - [Configuration File](#configuration-file)
   - [General](#general) — format, source resolution, secrets, `disabled: true`
   - [`disable_pwsh_execution_policy`](#disable_pwsh_execution_policy) — allow running local PowerShell scripts
@@ -122,6 +141,8 @@ The private config token and `BWS_ACCESS_TOKEN` are independent: the first autho
   - [`windows_product_key`](#windows_product_key) — install and activate a Windows product key
   - [`power`](#power) — sleep/display timeout settings
   - [`network`](#network) — static IP/gateway/DNS/MAC address
+  - [`time_sync`](#time_sync) — synchronize Windows Time with NTP peers
+  - [`windows_update`](#windows_update) — configure Windows Update behavior
   - [`delete_bootstrap_user`](#delete_bootstrap_user) — delete the account that ran bootstrap
 - [Reboot handling](#reboot-handling)
 - [Usage Scenarios](#usage-scenarios)
@@ -217,8 +238,8 @@ Every capability below is opt-in via its config key, and can also be selectively
   via winget if missing, and optionally sets its default profile.
   - Tag: `windows_terminal`
   - Config: [`windows_terminal`](#windows_terminal)
-- **Enable OpenSSH Server** — installs and starts `sshd`, configures
-  key-based login, pinned host keys, and the default shell for incoming sessions.
+- **Enable OpenSSH Server** — installs and starts `sshd` (skipping `winget`
+  if the `sshd` service is already installed on the image), configures key-based login, pinned host keys, and the default shell for incoming sessions.
   - Tag: `ssh`
   - Config: [`ssh_server`](#ssh_server)
 - **Disable the Windows ssh-agent service** — stops/disables it so a
@@ -238,7 +259,7 @@ Every capability below is opt-in via its config key, and can also be selectively
   - Tag: `smb`
   - Config: [`smb_shares`](#smb_shares)
 - **Create local user accounts** — creates local Windows accounts
-  (several password-source options), reconciles Administrators group membership, initializes their real Windows profile, and (much later in the run, once OpenSSH is installed) configures per-user SSH keys. Account creation and profile initialization run near the very start of the run, ahead of most other steps.
+  (several password-source options), reconciles Administrators group membership, initializes their real Windows profile, optionally configures Windows AutoLogon (`once` or `always`), and (much later in the run, once OpenSSH is installed) configures per-user SSH keys. Account creation and profile initialization run near the very start of the run, ahead of most other steps.
   - Tag: `local_users`
   - Config: [`local_users`](#local_users)
 - **Schedule first-login setup for local user accounts** — registers a
@@ -269,6 +290,14 @@ Every capability below is opt-in via its config key, and can also be selectively
   either right away or deferred to the next reboot via a scheduled task (applying it immediately can drop the very session bootstrap is running over); MAC is always deferred to a reboot via a registry write, never applied live.
   - Tag: `network`
   - Config: [`network`](#network)
+- **Synchronize Windows Time with configured NTP peers** — sets the
+  W32Time manual peer list, restarts W32Time, and verifies peer selection.
+  - Tag: `time_sync`
+  - Config: [`time_sync`](#time_sync)
+- **Configure Windows Update behavior** — sets Windows Update to `auto`,
+  `manual`, `pause` (up to 35 days), or `disable`.
+  - Tag: `windows_update`
+  - Config: [`windows_update`](#windows_update)
 - **Delete the bootstrap user account** — permanently deletes the local
   account that ran this script, once it's no longer needed (e.g. after a real admin account has been provisioned). Confirmation-gated, and refuses outright if it would leave the machine with no other enabled Administrator.
   - Tag: `cleanup`
@@ -311,19 +340,20 @@ When an authenticated fetch uses the insecure curl path, the token is stored in 
 | Parameter | Environment variable | Description |
 |---|---|---|
 | `-Download` (switch) | — | Only meaningful with `-ConfigUrl`/`BOOTSTRAP_CONFIG_URL`: writes the fetched config text to the explicit file `win-bootstrap.config.yaml` next to the script. Prompts before overwriting an existing file (errors instead, under `-Quiet`). No effect when the config came from a local path. |
-| `-Verify` (switch) | — | Read-only mode: checks only the state checks implemented for the config and reports `OK` / `NOT APPLIED` / `ERROR` (or `UNKNOWN` if a step has no verification check) per step. It is not a guarantee that every desired or deferred effect is complete. Still requires elevation. Mutually exclusive with `-ValidateConfig`. |
-| `-ValidateConfig` (switch) | — | Standalone, no-elevation check: resolves, fetches, parses, and statically validates the *entire* config (required fields, enum values, mutual exclusivity). It does not inspect machine state or guarantee that a later real run will succeed. Mutually exclusive with `-Verify`/`-Only`/`-Skip`; `-Download` still works alongside it. Prints `Config is valid.` (exit 0) or every problem found (exit 1). |
+| `-Verify` (switch) | — | Read-only mode: checks only the state checks implemented for the config and reports `OK` / `NOT APPLIED` / `ERROR` (or `UNKNOWN` if a step has no verification check) per step. It is not a guarantee that every desired or deferred effect is complete. Still requires elevation. Mutually exclusive with `-ValidateConfig` and `-ResolveSecretsTo`. |
+| `-ValidateConfig` (switch) | — | Standalone, no-elevation check: resolves, fetches, parses, and statically validates the *entire* config (required fields, enum values, mutual exclusivity). It does not inspect machine state or guarantee that a later real run will succeed. Mutually exclusive with `-Verify`/`-ResolveSecretsTo`/`-ShredConfig`/`-Only`/`-Skip`; `-Download` still works alongside it. Prints `Config is valid.` (exit 0) or every problem found (exit 1). |
+| `-ResolveSecretsTo <path>` | — | Standalone, no-elevation secret pre-resolution mode: resolves, fetches, parses, and statically validates the config, resolves every secret (`*_secret` and `*_secret_id`) from Bitwarden CLI (`bw`) and/or Bitwarden Secrets Manager (`bws`) into inline config values, removes `secret_manager`, and writes the resolved YAML to `<path>` with restricted ACLs (`NT AUTHORITY\SYSTEM`, `BUILTIN\Administrators`, and the current user), then exits `0`. Does not inspect or modify machine state. Useful on a host machine to pre-resolve secrets into a temporary file before injecting it into an isolated VM. Mutually exclusive with `-Verify`/`-ValidateConfig`/`-ShredConfig`/`-Only`/`-Skip`. |
 | `-Only <tags>` | — | Run only the step(s) matching these tag(s) (comma-separated for more than one), skipping everything else regardless of config. Mutually exclusive with `-Skip`. |
 | `-Skip <tags>` | — | Run every step except the one(s) matching these tag(s). Mutually exclusive with `-Only`. |
-| `-Quiet` / `-q` (switch) | — | Non-interactive mode: auto-confirms confirmation-gated risky operations, may reboot when configured changes require it, and fails immediately (instead of prompting) if not already elevated. |
-| `-ShredConfig` (switch) | — | When the config is loaded from a local file, overwrites the file on disk with zero bytes, flushes it to physical storage, and deletes it immediately after parsing and static validation succeed (before any provisioning step runs). Useful when an external orchestrator pre-resolves secrets into a temporary local config file. Mutually exclusive with `-ValidateConfig` and `-Verify`. |
+| `-Quiet` / `-q` (switch) | — | Non-interactive mode: auto-confirms confirmation-gated risky operations, may reboot when configured changes require it, and fails immediately (instead of prompting) if not already elevated or if Bitwarden CLI (`bw`) is locked/unauthenticated. |
+| `-ShredConfig` (switch) | — | When the config is loaded from a local file, overwrites the file on disk with zero bytes, flushes it to physical storage, and deletes it immediately after parsing and static validation succeed (before any provisioning step runs). Useful when an external orchestrator pre-resolves secrets into a temporary local config file. Mutually exclusive with `-ValidateConfig`, `-Verify`, and `-ResolveSecretsTo`. |
 | `-NoReboot` (switch) | — | Suppresses the automatic or prompted `Restart-Computer` at the end of a real run when one or more steps set `RebootRequired`. When all steps succeed and a reboot is required, exits with code `3010` (`ERROR_SUCCESS_REBOOT_REQUIRED`). |
 
 ### Run transcript and exit status
 
-Real runs write a protected transcript under `%WINDIR%\Logs\win-bootstrap\bootstrap-run-*.log`; access is restricted to SYSTEM and local Administrators. `-ValidateConfig` and `-Verify` do not create a persistent transcript. Generated-password and KDNET key handoff output is kept out of the transcript; inspect the one-time console output or the generated handoff file described in the relevant section. This protects bootstrap's own transcript only; external console, host, or process logging may still capture output. Transcript logs from older versions or other locations are not migrated.
+Real runs write a protected transcript under `%WINDIR%\Logs\win-bootstrap\bootstrap-run-*.log`; access is restricted to SYSTEM and local Administrators. `-ValidateConfig`, `-Verify`, and `-ResolveSecretsTo` do not create a persistent transcript. Generated-password and KDNET key handoff output is kept out of the transcript; inspect the one-time console output or the generated handoff file described in the relevant section. This protects bootstrap's own transcript only; external console, host, or process logging may still capture output. Transcript logs from older versions or other locations are not migrated.
 
-The process exits `1` when a real run catches a failed/errored/not-applied step, or when `-Verify` finds a mismatch or verification error; it exits `3010` when `-NoReboot` is specified, all steps succeeded, and a reboot is required; otherwise it exits `0`. Exit status reflects the implemented checks, not a guarantee that every deferred effect is complete.
+The process exits `1` when a real run catches a failed/errored/not-applied step, when `-Verify` finds a mismatch or verification error, or when `-ValidateConfig`/`-ResolveSecretsTo` fails validation or secret resolution; it exits `3010` when `-NoReboot` is specified, all steps succeeded, and a reboot is required; otherwise it exits `0`. Exit status reflects the implemented checks, not a guarantee that every deferred effect is complete.
 
 ### Step tags (for `-Only`/`-Skip`)
 
@@ -357,6 +387,8 @@ Matching is case-insensitive.
 | `product_key` | [`windows_product_key`](#windows_product_key) |
 | `power` | [`power`](#power) |
 | `network` | [`network`](#network) |
+| `time_sync` | [`time_sync`](#time_sync) |
+| `windows_update` | [`windows_update`](#windows_update) |
 | `cleanup` | [`delete_bootstrap_user`](#delete_bootstrap_user) |
 
 Two things worth knowing about `-Only`/`-Skip`:
@@ -368,7 +400,7 @@ Two things worth knowing about `-Only`/`-Skip`:
 
 ## Secrets
 
-Fields that need secret material (certificates, private keys, passwords) consistently support the same set of mutually-exclusive sources, so there's exactly one pattern to learn regardless of which field you're looking at.
+Fields that need secret material (certificates, private keys, passwords, product keys) consistently support the same set of mutually-exclusive sources, so there's one pattern to learn regardless of which field you're looking at.
 
 ### Sources
 
@@ -377,34 +409,40 @@ Fields that need secret material (certificates, private keys, passwords) consist
 | *(bare field)* | Inline value | `key: \|` block scalar for multi-line values (certificates, private keys). |
 | `_path` | Local file on the target machine | Read at run time — never embedded in the config. |
 | `_url` | Fetched over HTTP(S) | The bearer token is sent only when the URL has the same scheme, host, and port as the selected config URL; authenticated cross-origin redirects are rejected. |
-| `_secret_id` | A secret ID in a secrets manager | Today always means **Bitwarden Secrets Manager** — see [Bitwarden Secrets Manager](#bitwarden-secrets-manager) below. |
+| `_secret` | A structured secret map (`bw` or `bws`) | Supports both **Bitwarden Password Manager CLI (`bw`)** (`path` + `field`) and **Bitwarden Secrets Manager (`bws`)** (`id`), with an optional per-field `source: bw \| bws` override. |
+| `_secret_id` | A secret ID in Bitwarden Secrets Manager | Legacy shorthand for `_secret: { source: bws, id: <uuid> }` — requires top-level `secret_manager: bws`. |
 
 Exactly one source must be set per field — the script errors out up front if zero or more than one is set for the same field.
 
 ### Which fields support which sources
 
-| Config field family | Inline | `_path` | `_url` | `_secret_id` | Also supports |
-|---|---|---|---|---|---|
-| [`root_ca[].cert`](#root_ca) | `cert` | `cert_path` | `cert_url` | `cert_secret_id` | — |
-| [`ssh_server.host_keys[].private_key`](#ssh_server) | `private_key` | `private_key_path` | `private_key_url` | `private_key_secret_id` | — |
-| [`local_users[].password`](#local_users) | `password` | `password_path` | `password_url` | `password_secret_id` | `generate: true`, `ask: true` |
-| [`kernel_debugging.network.key`](#kernel_debugging) | `key` | `key_path` | `key_url` | `key_secret_id` | `generate: true` |
+| Config field family | Inline | `_path` | `_url` | `_secret` | `_secret_id` | Also supports |
+|---|---|---|---|---|---|---|
+| [`root_ca[].cert`](#root_ca) | `cert` | `cert_path` | `cert_url` | `cert_secret` | `cert_secret_id` | — |
+| [`ssh_server.host_keys[].private_key`](#ssh_server) | `private_key` | `private_key_path` | `private_key_url` | `private_key_secret` | `private_key_secret_id` | — |
+| [`local_users[].password`](#local_users) | `password` | `password_path` | `password_url` | `password_secret` | `password_secret_id` | `generate: true`, `ask: true` |
+| [`kernel_debugging.network.key`](#kernel_debugging) | `key` | `key_path` | `key_url` | `key_secret` | `key_secret_id` | `generate: true` |
+| [`windows_product_key`](#windows_product_key) | `windows_product_key` | `windows_product_key_path` | `windows_product_key_url` | `windows_product_key_secret` | `windows_product_key_secret_id` | — |
 
 Worth calling out: `kernel_debugging.network.key` grants remote kernel debugging access, which means full control of the machine — treat it with at least as much care as a root CA private key or an admin password, not as a lesser "just a debug setting".
 
 ### SSH public key lists
 
-[`ssh_server.authorized_keys`](#ssh_server) and [`local_users[].ssh_keys`](#local_users) don't fit the single-field 4-source pattern above — each is a *list*, and each item in that list is either:
+[`ssh_server.authorized_keys`](#ssh_server) and [`local_users[].ssh_keys`](#local_users) are *lists*, and each item in that list is either:
 
-- a literal string (the public key line itself), or
-- a map with a single `key_secret_id` key, resolved from Bitwarden
-  Secrets Manager the same way as any other `_secret_id` field.
+- a literal string (the public key line itself),
+- a map with a single `key_secret` map (resolved via `bw` or `bws`), or
+- a map with a single `key_secret_id` key (resolved via `bws`).
 
-The two forms can be freely mixed in the same list:
+All three forms can be freely mixed in the same list:
 
 ```yaml
 authorized_keys:
   - "ssh-ed25519 AAAA... a-literal-key"
+  - key_secret:
+      source: bw
+      path: Personal/My-SSH-Key
+      field: public_key
   - key_secret_id: 00000000-0000-0000-0000-000000000000
 ```
 
@@ -421,16 +459,54 @@ Where a real secret shouldn't need to be written into the config at all:
 
 ### Bitwarden Secrets Manager
 
-Any `_secret_id` field resolves its value from Bitwarden Secrets Manager at run time instead of carrying the real secret inline — this is what makes a config safe to commit to git even with real certificates, keys, or passwords involved, since none of them need to appear in the file at all.
+Any `_secret_id` field, or any `_secret` map whose effective source is `bws` (`source: bws`, or `source` omitted with top-level `secret_manager: bws`), resolves its value from Bitwarden Secrets Manager at run time instead of carrying the real secret inline — this is what makes a config safe to commit to git even with real certificates, keys, or passwords involved, since none of them need to appear in the file at all.
 
 Requirements:
 
-- A top-level `secret_manager: bws` key (the only supported value
-  today). Using any `_secret_id` field without it is a config error, caught by [`-ValidateConfig`](#cli-parameters-and-environment-variables) as a structural configuration error. `-ValidateConfig` does not check whether the token is present or usable; the token is required when a run resolves the referenced secret, including `-Verify`.
+- Either a per-field `source: bws` inside `_secret`, or a top-level `secret_manager: bws` key (required whenever legacy `_secret_id` fields are used). Caught by [`-ValidateConfig`](#cli-parameters-and-environment-variables) as a structural configuration error if missing. `-ValidateConfig` does not check whether the token is present or usable; the token is required when a run resolves the referenced secret, including `-Verify` and `-ResolveSecretsTo`.
 - `$env:BWS_ACCESS_TOKEN` — a scoped, independently revocable Bitwarden
   Secrets Manager *machine* access token — set before running. Only ever read from the environment, never accepted as a parameter or passed in child-process arguments. Avoid typing its literal value into a command that your shell records in history.
 
-The `bws` CLI itself is installed automatically on first use — the latest `bws-v*` release is resolved from its official GitHub releases (checksum-verified against Bitwarden's own published checksums before ever being run), installed permanently to `%ProgramData%\bws\bws.exe`, and added to the machine `PATH` so it's also usable as a normal command afterward. This install step never happens under `-Verify` (it would be a real machine mutation) — if `bws.exe` isn't already present, `-Verify` reports an `ERROR` for that step instead, asking you to run for real first. Secrets are fetched fresh on every run (never cached to disk), with an in-memory-only cache so the same secret ID referenced twice in one run doesn't trigger two `bws` calls.
+The `bws` CLI itself is installed automatically on first use — the latest `bws-v*` release is resolved from its official GitHub releases (checksum-verified against Bitwarden's own published checksums before ever being run), installed permanently to `%ProgramData%\bws\bws.exe` (or `%LOCALAPPDATA%\bws\bws.exe` when running unprivileged under `-ResolveSecretsTo`), and added to the `PATH` so it's also usable as a normal command afterward. This install step never happens under `-Verify` (it would be a real machine mutation) — if `bws.exe` isn't already present, `-Verify` reports an `ERROR` for that step instead, asking you to run for real first. Secrets are fetched fresh on every run (never cached to disk), with an in-memory-only cache so the same secret ID referenced twice in one run doesn't trigger two `bws` calls.
+
+### Bitwarden Password Manager CLI (`bw`)
+
+Any `_secret` map whose effective source is `bw` (`source: bw`, or `source` omitted with top-level `secret_manager: bw`) resolves its value from a personal or organizational Bitwarden Password Manager vault via the standard Bitwarden CLI (`bw.exe`).
+
+```yaml
+secret_manager: bw
+
+local_users:
+  - name: developer
+    password_secret:
+      path: Lab/developer-account
+      field: password
+    admin: true
+    ssh_keys:
+      - key_secret:
+          path: Personal/id_ed25519
+          field: public_key
+```
+
+You can also mix `bw` and `bws` in the same configuration file by specifying `source: bw` or `source: bws` on individual `_secret` maps.
+
+`_secret` fields for `source: bw`:
+
+| Field | Required/Optional | Description |
+|---|---|---|
+| `source` | Optional if top-level `secret_manager: bw` is set | `bw` (or `bws` for Bitwarden Secrets Manager). |
+| `path` | Required | Vault path in `<folder>/<item-name>` form (supports nested folders such as `Team/Lab/vm-admin`), or `<item-name>` (or `/<item-name>`) for an item in the vault root (no folder). Folder and item names are matched case-sensitively; duplicate item names in the same folder fail with an explicit error. |
+| `field` | Required | Which field to extract from the vault item: `password` (`login.password`), `username` (`login.username`), `notes` (`notes`), `public_key` (`sshKey.publicKey`), `private_key` (`sshKey.privateKey`), or `custom:<FieldName>` (exact case-sensitive match against `fields[].name`). |
+
+Runtime behavior and session lifecycle:
+
+- **Prerequisite**: `bw.exe` (`Bitwarden.CLI`) must be installed and available on `PATH`.
+- **Authentication and unlock**: on the first `bw` secret lookup, the script checks `bw status --nointeraction`:
+  - If the vault is already `unlocked` (via `$env:BW_SESSION`), the existing session is reused and left unlocked when the run finishes.
+  - If the vault is `locked`, an interactive run prompts for your master password via `bw unlock --raw`; under `-Quiet` (or in a non-interactive session), it fails immediately with a clear error.
+  - If the CLI is `unauthenticated`, an interactive run starts `bw login --raw` (supporting email, master password, and 2FA/MFA prompts); under `-Quiet`, it fails immediately.
+- **Sync and caching**: once unlocked, the script runs `bw sync` and caches folder and item metadata in memory for the duration of the run so multiple `_secret` references only query the vault once.
+- **Automatic lock**: if the run itself unlocked or logged into the vault, a `finally` block automatically runs `bw lock` and clears `$env:BW_SESSION` before exiting (including under `-ResolveSecretsTo` or when an error occurs).
 
 ## Configuration File
 
@@ -443,12 +519,12 @@ The `bws` CLI itself is installed automatically on first use — the latest `bws
 - **A fully-commented, complete example covering every section below**
   lives at [`win-bootstrap.config.example.yaml`](../win-bootstrap/win-bootstrap.config.example.yaml) — copy it, customize it, and either name your copy `win-bootstrap.config.yaml` next to the script, pass its path via `-ConfigPath`, or host it and pass its raw URL via `-ConfigUrl`.
 - **Secrets**: fields that need secret material (certificates, private
-  keys, passwords) consistently support the same inline/`_path`/`_url`/ `_secret_id` sources, plus on-machine generation for some fields — see the dedicated [Secrets](#secrets) section for the full list of which fields support what, and how Bitwarden Secrets Manager fits in.
+  keys, passwords, product keys) consistently support the same inline/`_path`/`_url`/`_secret`/`_secret_id` sources, plus on-machine generation for some fields — see the dedicated [Secrets](#secrets) section for the full list of which fields support what, and how Bitwarden CLI (`bw`) and Bitwarden Secrets Manager (`bws`) fit in.
 - **The `disabled: true` convention**: supported sections can be switched
   off without deleting their content — useful while iterating on a config.
 
   - Map sections ([`firewall`](#firewall), [`recovery_partition`](#recovery_partition),
-  [`power`](#power), [`network`](#network)) take it directly inside the map. These are the only generic map-section `disabled` forms.
+  [`power`](#power), [`network`](#network), [`windows_update`](#windows_update)) take it directly inside the map. These are the only generic map-section `disabled` forms.
   - List sections ([`root_ca`](#root_ca), [`defender_exclusions`](#defender_exclusions),
   [`smb_shares`](#smb_shares), [`local_users`](#local_users), [`apps`](#apps)) can be disabled as a whole by using this block-map form instead of a bare list:
 
@@ -489,10 +565,11 @@ A list — install any number of root CA certificates into `Cert:\LocalMachine\R
 |---|---|---|
 | `name` | Required | Friendly name, used in step and status messages. |
 | `install` | Required | `true` to install this entry; `false` skips it (kept in the file for later). |
-| `cert` | Exactly one of `cert`/`cert_path`/`cert_url`/`cert_secret_id` required | Inline PEM certificate text (`key: \|` block scalar). |
+| `cert` | Exactly one of `cert`/`cert_path`/`cert_url`/`cert_secret`/`cert_secret_id` required | Inline PEM certificate text (`key: \|` block scalar). |
 | `cert_path` | — | Local file path to the certificate. |
 | `cert_url` | — | URL to fetch the certificate from. |
-| `cert_secret_id` | — | Bitwarden Secrets Manager secret ID (needs `secret_manager: bws`, see [General](#general)). |
+| `cert_secret` | — | Structured Bitwarden secret map (`bw` or `bws`, see [Secrets](#secrets)). |
+| `cert_secret_id` | — | Bitwarden Secrets Manager secret ID (needs `secret_manager: bws`, see [Secrets](#secrets)). |
 
 ### `recovery_partition`
 
@@ -729,20 +806,21 @@ A map. Enables OpenSSH Server.
 
 | Field | Required/Optional | Description |
 |---|---|---|
-| `enable` | Required (`true` to act) | Installs and starts `sshd`, opens the firewall rule, and fixes the SFTP subsystem path. |
+| `enable` | Required (`true` to act) | Installs (via `winget`, skipped automatically if the `sshd` service is already installed) and starts `sshd`, opens the firewall rule, and fixes the SFTP subsystem path. |
 | `default_shell` | Optional | `cmd` \| `pwsh5` \| `pwsh7` — shell used for new SSH sessions. Omit to leave Windows' own `cmd.exe` default. An unavailable/misspelled shell fails this step with a clear error. `pwsh7` relies on [`install_powershell7`](#install_powershell7). |
 | `host_keys` | Optional | List of pinned host keys — see below. Without it, `sshd` auto-generates its own key(s), silently changing the machine's SSH identity/fingerprint on every reinstall. |
-| `authorized_keys` | Optional | List of public key lines for key-based login — each item is a literal `"ssh-... comment"` string or a block map with `key_secret_id` (see [SSH public key lists](#ssh-public-key-lists)). Without any, the server still runs but only accepts password authentication. |
+| `authorized_keys` | Optional | List of public key lines for key-based login — each item is a literal `"ssh-... comment"` string or a block map with `key_secret` or `key_secret_id` (see [SSH public key lists](#ssh-public-key-lists)). Without any, the server still runs but only accepts password authentication. |
 
 `host_keys` entries:
 
 | Field | Required/Optional | Description |
 |---|---|---|
 | `type` | Required | `rsa` \| `ecdsa` \| `ed25519` (`ed25519` alone is enough for identity purposes). |
-| `private_key` | Exactly one of `private_key`/`private_key_path`/`private_key_url`/`private_key_secret_id` required | Inline OpenSSH private key. |
+| `private_key` | Exactly one of `private_key`/`private_key_path`/`private_key_url`/`private_key_secret`/`private_key_secret_id` required | Inline OpenSSH private key. |
 | `private_key_path` | — | Local file path. |
 | `private_key_url` | — | Fetched URL. |
-| `private_key_secret_id` | — | Bitwarden Secrets Manager secret ID (needs `secret_manager: bws`, see [General](#general)). |
+| `private_key_secret` | — | Structured Bitwarden secret map (`bw` or `bws`, see [Secrets](#secrets)). |
+| `private_key_secret_id` | — | Bitwarden Secrets Manager secret ID (needs `secret_manager: bws`, see [Secrets](#secrets)). |
 
 The matching public key is always derived automatically — there's no field to supply it separately.
 
@@ -819,13 +897,13 @@ A list — create local Windows accounts.
 | Field | Required/Optional | Description |
 |---|---|---|
 | `name` | Required | Account name. |
-| `password` / `password_path` / `password_url` / `password_secret_id` / `generate` / `ask` | Exactly one required | Password source — see below. |
+| `password` / `password_path` / `password_url` / `password_secret` / `password_secret_id` / `generate` / `ask` | Exactly one required | Password source — see below. |
 | `admin` | Optional, default `false` | Local Administrators group membership — reconciled (added/removed) on every run. |
 | `password_never_expires` | Optional, default `false` | Only applied when the account is first created. |
 | `initialize_profile` | Optional, default `true` | Force-creates the account's real Windows profile (`C:\Users\<name>`, registry hive) right after creation, without needing an actual interactive logon — see below. Set `false` to opt a given account out. |
 | `complete_setup_on_first_login` | Optional, default `true` | Schedules this account's `scope: user` [`apps`](#apps) to install automatically at its next real interactive logon — see below. Set `false` to opt a given account out. |
 | `autologon` | Optional, default `false` | `once` \| `always` \| `false` — configures Windows AutoLogon for this account using encrypted LSA Private Data (`DefaultPassword`), never plaintext registry `DefaultPassword`. At most one active `local_users` entry may set `autologon` to `once` or `always`; cannot be combined with `generate: true` or `ask: true`. |
-| `ssh_keys` | Optional | `default` (reuses [`ssh_server.authorized_keys`](#ssh_server)) or an explicit list of `"ssh-... comment"` strings / block maps with `key_secret_id` (see [SSH public key lists](#ssh-public-key-lists)). Admin accounts share the machine-wide `administrators_authorized_keys` file; non-admin accounts get their own per-user file, which needs the account's real profile directory to exist first — normally handled automatically by `initialize_profile` above. |
+| `ssh_keys` | Optional | `default` (reuses [`ssh_server.authorized_keys`](#ssh_server)) or an explicit list of `"ssh-... comment"` strings / block maps with `key_secret` or `key_secret_id` (see [SSH public key lists](#ssh-public-key-lists)). Admin accounts share the machine-wide `administrators_authorized_keys` file; non-admin accounts get their own per-user file, which needs the account's real profile directory to exist first — normally handled automatically by `initialize_profile` above. |
 | `disabled` | Optional, default `false` | Skip just this entry (see [General](#general)). |
 
 Password sources (exactly one):
@@ -835,11 +913,12 @@ Password sources (exactly one):
 | `password` | Inline plaintext password. |
 | `password_path` | Local file containing the password. |
 | `password_url` | Fetched URL; the config token is used only for the selected config URL's exact origin. |
-| `password_secret_id` | Bitwarden Secrets Manager secret ID (needs `secret_manager: bws`, see [General](#general)). |
+| `password_secret` | Structured Bitwarden secret map (`bw` or `bws`, see [Secrets](#secrets)). |
+| `password_secret_id` | Bitwarden Secrets Manager secret ID (needs `secret_manager: bws`, see [Secrets](#secrets)). |
 | `generate: true` | Auto-generates a strong random password. |
 | `ask: true` | Prompts for the password twice, interactively. Falls back to `generate`'s behavior under `-Quiet` (no console to prompt on). |
 
-You can avoid storing an inline password: `password_path`, `password_url`, and `password_secret_id` resolve it outside the config, while `generate` and `ask` obtain it at run time (`ask` falls back to generation under `-Quiet`). Only generated passwords force a change at next logon. The generated value is revealed exactly once (console, or a locked-down file next to the script under `-Quiet`). If an account with this name already exists, its password is **never** touched by a later run — only group membership is kept in sync.
+You can avoid storing an inline password: `password_path`, `password_url`, `password_secret`, and `password_secret_id` resolve it outside the config, while `generate` and `ask` obtain it at run time (`ask` falls back to generation under `-Quiet`). Only generated passwords force a change at next logon. The generated value is revealed exactly once (console, or a locked-down file next to the script under `-Quiet`). If an account with this name already exists, its password is **never** touched by a later run — only group membership is kept in sync.
 
 **`initialize_profile`**: Windows only creates a local account's real profile (folder, `NTUSER.DAT` registry hive, `ProfileList` registry entry) at that account's first interactive logon. This forces that to happen right away, via a one-shot Scheduled Task registered with the account's own credentials — Task Scheduler performs the same profile-loading a real logon does before running the task's (trivial, no-op) action, so no actual desktop session is needed. The account is first granted the "Log on as a batch job" right (via `secedit.exe`, confirmed necessary live — Task Scheduler does *not* auto-grant it), otherwise the task registers successfully but silently never actually runs. This only works right after the account is *freshly created in the same run*: if the account already existed before this run, its current password isn't known to the script (passwords are never touched for pre-existing accounts — see above), so this step can't do anything for it and just warns instead. In that case, log on manually once and re-run bootstrap.
 
@@ -913,7 +992,7 @@ A map. Enables Windows kernel debugging (the `bcdedit /debug` + `/dbgsettings` c
 | `serial.baud_rate` | Optional, default `115200` | Baud rate. |
 | `network.host_ip` | Required for `transport: network` | Debug host IP. |
 | `network.port` | Required for `transport: network` | Debug host port. |
-| `network.key` / `network.key_path` / `network.key_url` / `network.key_secret_id` / `network.generate` | Exactly one required for `transport: network` | Explicit shared secret (inline, local file, URL, or Bitwarden Secrets Manager secret ID — see [Secrets](#secrets)), or `generate: true` to auto-generate one (revealed exactly once, same convention as `local_users` generated passwords). An already-configured key is never regenerated/touched by a later run. |
+| `network.key` / `network.key_path` / `network.key_url` / `network.key_secret` / `network.key_secret_id` / `network.generate` | Exactly one required for `transport: network` | Explicit shared secret (inline, local file, URL, structured Bitwarden secret map, or Bitwarden Secrets Manager secret ID — see [Secrets](#secrets)), or `generate: true` to auto-generate one (revealed exactly once, same convention as `local_users` generated passwords). An already-configured key is never regenerated/touched by a later run. |
 | `network.bus_params` | Optional | PCI location of the debug NIC as `bus.device.function` (e.g. `2.0.0`) — `bcdedit /set "{dbgsettings}" busparams <value>`. Only needed when Windows can't auto-select the right NIC for KDNET (e.g. multiple NICs). Carries no secret, so unlike the key it's re-applied (and corrected) on every run if it drifts from the configured value. |
 
 Note: `/dbgsettings` (the transport) is a single **global** BCD object shared by any boot entry with debug on, not per-entry.
@@ -924,10 +1003,14 @@ Note: `/dbgsettings` (the transport) is a single **global** BCD object shared by
 windows_product_key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
 # windows_product_key_path: C:\path\to\key.txt
 # windows_product_key_url: https://example.com/key.txt
+# windows_product_key_secret:
+#   source: bw
+#   path: Licenses/Windows-11-Pro
+#   field: notes
 # windows_product_key_secret_id: 00000000-0000-0000-0000-000000000000
 ```
 
-Exactly one of the 4 fields above (inline value, local file, URL, or Bitwarden Secrets Manager secret ID - see [Secrets](#secrets)). Installs the key and requests online activation via the same `SoftwareLicensingService`/`SoftwareLicensingProduct` WMI methods `slmgr.vbs` itself uses internally.
+Exactly one of the 5 fields above (inline value, local file, URL, structured Bitwarden secret map, or Bitwarden Secrets Manager secret ID - see [Secrets](#secrets)). Installs the key and requests online activation via the same `SoftwareLicensingService`/`SoftwareLicensingProduct` WMI methods `slmgr.vbs` itself uses internally.
 
 **Important limitation:** Windows never exposes a fully-installed product key back out, for security reasons - only the last 5 characters (`PartialProductKey`). So verification is necessarily a **suffix comparison**, not a full-key comparison: if the currently installed key's last 5 characters match the configured key's last 5 characters *and* the machine is already licensed, the step reports OK and touches nothing. This means an already-activated OEM/pre-installed license is left alone rather than blindly overwritten, as long as its last 5 characters happen to match what's configured (in practice, different keys essentially never share a last-5-character suffix).
 
@@ -1022,6 +1105,28 @@ NTP server for other machines; operating one is a separate network decision.
 Keep organization-specific peer names in a target or private profile rather
 than a reusable golden-image profile.
 
+### `windows_update`
+
+```yaml
+windows_update:
+  mode: pause
+  # disabled: true
+```
+
+A map. Configures Windows Update behavior via `HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`, `HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings`, and the `wuauserv` service.
+
+| Field | Required/Optional | Description |
+|---|---|---|
+| `mode` | Required (to act) | `auto` \| `manual` \| `pause` \| `disable`. |
+| `disabled` | Optional, default `false` | Skip this whole section (see [General](#general)). |
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Removes `NoAutoUpdate`/`AUOptions` policies, clears any active pause window, and sets `wuauserv` startup to `Manual` (Windows' default automatic update state). |
+| `manual` | Sets `NoAutoUpdate = 1` and `AUOptions = 2` (suppresses background automatic updates while keeping manual update checks available), clears any active pause window, and ensures `wuauserv` is not `Disabled`. |
+| `pause` | Sets `NoAutoUpdate = 1`, `AUOptions = 2`, and configures a 35-day feature/quality update pause window (`PauseUpdatesExpiryTime` and related UX settings). |
+| `disable` | Sets `NoAutoUpdate = 1`, stops `wuauserv`, and sets its startup type to `Disabled`. |
+
 ### `delete_bootstrap_user`
 
 ```yaml
@@ -1055,6 +1160,7 @@ Several steps ([`recovery_partition`](#recovery_partition)'s delete, [`kernel_de
   [`recovery_partition`](#recovery_partition)'s delete - type `YES` to reboot now, anything else to leave it for later (the machine stays in a valid, working state either way; it just won't have every configured change applied until it's rebooted).
 - **`-Quiet`**: reboots automatically, no prompt - an unattended run
   shouldn't finish half-applied, waiting indefinitely on a manual reboot nobody's there to trigger.
+- **`-NoReboot`**: suppresses `Restart-Computer` in both interactive and `-Quiet` modes and exits with code `3010` (`ERROR_SUCCESS_REBOOT_REQUIRED`) when all steps succeeded and a reboot is required, allowing an external orchestrator (e.g. a hypervisor provisioning script) to close its guest session cleanly and trigger the reboot itself.
 
 Rebooting can end the current session immediately (e.g. SSH/RDP), same as the other confirmation-gated destructive actions in this script.
 
@@ -1165,14 +1271,16 @@ All three are documented in detail in [CLI Parameters and Environment Variables]
 7) when it's already installed, falling back to `powershell.exe`
   (Windows PowerShell 5.1) otherwise. This works around a confirmed Windows PowerShell 5.1 bug (observed on at least one arm64 machine) where `Microsoft.PowerShell.Security` intermittently fails to auto-load for this specific script, breaking `Get-ExecutionPolicy`, the `Cert:\` drive, and `Get-Acl`. On a genuinely fresh machine (before [`install_powershell7`](#install_powershell7) has ever run), `win-bootstrap.cmd` falls back to `powershell.exe` — if that first pass happens to hit the bug, re-run after PowerShell 7 is installed so the wrapper can pick `pwsh` automatically. **Prefer `win-bootstrap.cmd` over invoking `win-bootstrap.ps1` directly for any repeat/permanent use.**
 
-### Storing secrets in Bitwarden Secrets Manager instead of the config file
+### Storing secrets in Bitwarden instead of the config file
 
-See the dedicated [Secrets](#secrets) section — in short, any `_secret_id` field resolves its value from Bitwarden Secrets Manager at run time instead of carrying the real secret inline, which is what makes a config safe to commit to git even with real certificates, keys, or passwords involved.
+See the dedicated [Secrets](#secrets) section — in short, any `_secret` or `_secret_id` field resolves its value from Bitwarden Password Manager CLI (`bw`) or Bitwarden Secrets Manager (`bws`) at run time (or on the host ahead of time via `-ResolveSecretsTo`) instead of carrying the real secret inline, which is what makes a config safe to commit to git even with real certificates, keys, or passwords involved.
 
 ### Verify-before-apply and re-verification
 
 - [`-ValidateConfig`](#cli-parameters-and-environment-variables) checks
   the config itself for authoring mistakes — no elevation, no machine involved at all, so it can run anywhere, before a config is ever deployed.
+- [`-ResolveSecretsTo <path>`](#cli-parameters-and-environment-variables)
+  validates the config and resolves all `bw`/`bws` secrets into an ACL-restricted YAML file without requiring elevation — ideal for host-side pre-flight resolution before injecting the config into an isolated guest VM with `-ShredConfig`.
 - `-Verify` reports the current state of every configured step against
   the config — `OK` / `NOT APPLIED` / `ERROR` / `UNKNOWN` — without ever changing anything on the machine. Useful both before a real run (to preview) and after one (to confirm).
 - `-Download` writes a config fetched via `-ConfigUrl` to the explicit

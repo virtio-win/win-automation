@@ -20,7 +20,8 @@
 #
 # The following sections support "disabled: true" (default false). It
 # skips configured actions; it does not undo earlier changes:
-#   - firewall / recovery_partition / power / network: inside the map.
+#   - firewall / recovery_partition / power / network / windows_update:
+#     inside the map.
 #   - defender_exclusions / smb_shares / local_users / apps: on an
 #     individual list entry to skip that entry.
 #   - root_ca: use "install: false" for an individual certificate;
@@ -60,16 +61,27 @@
 # mappings, no anchors/aliases, no multi-document files. Comments start
 # with #. Write mappings as indented key/value lines.
 #
-# secret_manager (optional): required only if any field below uses a
-# "_secret_id" source (cert_secret_id, private_key_secret_id,
-# password_secret_id) - a secret ID in Bitwarden Secrets Manager, fetched
-# at run time via the bws CLI (installed automatically on first use, and
-# added to the machine PATH). "bws" is the only supported value today.
-# -ValidateConfig checks that secret_manager: bws is configured when a
-# _secret_id field is used. It does not check BWS_ACCESS_TOKEN or fetch a
-# secret. Set $env:BWS_ACCESS_TOKEN before a run that resolves secrets;
-# a missing token or inaccessible secret fails when the resource is read.
+# secret_manager (optional): sets the default secret manager ("bws" or "bw")
+# for structured *_secret maps (cert_secret, private_key_secret,
+# password_secret, key_secret, windows_product_key_secret) that omit an
+# explicit "source" field, and is required ("bws") when any legacy
+# *_secret_id field is used:
+#   - "bw": Bitwarden Password Manager CLI (bw.exe on PATH). Each *_secret
+#     map takes "path" (<folder>/<item-name> or <item-name>) and "field"
+#     (password | username | notes | public_key | private_key |
+#     custom:<FieldName>). Prompts for bw unlock/login interactively when
+#     needed (or uses $env:BW_SESSION), syncs the vault, and auto-locks on
+#     exit if unlocked by this run.
+#   - "bws": Bitwarden Secrets Manager (bws.exe, installed automatically on
+#     first use). Each *_secret map takes "id: <uuid>" (or use the legacy
+#     *_secret_id shorthand). Requires $env:BWS_ACCESS_TOKEN set before
+#     running.
+# Individual *_secret maps can also set "source: bw" or "source: bws" to mix
+# both secret managers in the same config. Use -ResolveSecretsTo <path> to
+# pre-resolve all secrets into an inline YAML file on a host machine without
+# elevation before injecting it into an isolated VM.
 # secret_manager: bws
+# secret_manager: bw
 
 # ----------------------------------------------------------------------------
 # computer_name
@@ -281,6 +293,8 @@ smb_shares:
 #   password_path           - local file containing the password
 #   password_url            - fetched; token restricted to the config URL
 #                             origin (see the shared *_url rule above)
+#   password_secret         - structured Bitwarden secret map (bw or bws; see
+#                             secret_manager above)
 #   password_secret_id      - a Bitwarden Secrets Manager secret ID (needs
 #                             secret_manager: bws above and
 #                             $env:BWS_ACCESS_TOKEN set)
@@ -330,16 +344,17 @@ smb_shares:
 #                             to skip every account at once - see the
 #                             top-of-file note on disabled: true)
 #
-# Exactly one of password / password_path / password_url /
+# Exactly one of password / password_path / password_url / password_secret /
 # password_secret_id / generate / ask must be selected. Remove the active
 # generate: true before enabling one of the commented alternatives below.
 # Likewise, replace the active inline value rather than adding a second
-# source when switching a certificate or private key to _path/_url/_secret_id.
+# source when switching a certificate or private key to
+# _path/_url/_secret/_secret_id.
 #
-# password_path, password_url, password_secret_id, and interactive ask all
-# avoid storing the password in this YAML. generate needs no pre-existing
-# password source; ask falls back to generation under -Quiet. With a
-# generated password, the account must change it at next logon, and the
+# password_path, password_url, password_secret, password_secret_id, and
+# interactive ask all avoid storing the password in this YAML. generate needs
+# no pre-existing password source; ask falls back to generation under -Quiet.
+# With a generated password, the account must change it at next logon, and the
 # generated value is revealed exactly once - printed to the console if
 # interactive, or (in -Quiet mode, since output may just scroll into an
 # unattended log) written to a locked-down file next to this script named
@@ -364,14 +379,22 @@ local_users:
     # password: "REPLACE-WITH-AN-ACTUAL-STRONG-PASSWORD"
     # password_path: C:\path\to\password.txt
     # password_url: https://example.com/password
+    # password_secret:
+    #   source: bw
+    #   path: Lab/contractor
+    #   field: password
     # password_secret_id: 00000000-0000-0000-0000-000000000000
     # ssh_keys: default
     # 'default' above reuses ssh_server.authorized_keys below; alternatively
-    # give a list of explicit "ssh-... comment" lines and/or
-    # block maps with key_secret_id (a Bitwarden Secrets Manager secret ID -
-    # see ssh_server.authorized_keys below for the same pattern), e.g.:
+    # give a list of explicit "ssh-... comment" lines and/or block maps with
+    # key_secret (bw or bws) or key_secret_id (bws - see
+    # ssh_server.authorized_keys below for the same pattern), e.g.:
     #   ssh_keys:
     #     - "ssh-ed25519 AAAA...replace-with-your-actual-public-key... your-comment"
+    #     - key_secret:
+    #         source: bw
+    #         path: Personal/id_ed25519
+    #         field: public_key
     #     - key_secret_id: 00000000-0000-0000-0000-000000000000
     # Omit entirely = no SSH key configured for this user. Admin accounts
     # share one file (administrators_authorized_keys) regardless of which
@@ -412,8 +435,9 @@ disable_winssh_agent: true
 # ----------------------------------------------------------------------------
 # ssh_server
 # ----------------------------------------------------------------------------
-# Enables OpenSSH Server. With no authorized_keys, the server still runs
-# but only accepts password authentication. default_shell is optional -
+# Enables OpenSSH Server (skipping winget installation if the sshd service is
+# already installed on the image). With no authorized_keys, the server still
+# runs but only accepts password authentication. default_shell is optional -
 # cmd | pwsh5 (Windows PowerShell 5.1) | pwsh7 (PowerShell 7) - omit it to
 # leave Windows' own cmd.exe default alone. Any unavailable/misspelled
 # shell fails this step with a clear error instead of silently doing
@@ -425,11 +449,11 @@ disable_winssh_agent: true
 # SSH identity/fingerprint and breaks every client's known_hosts trust.
 # Pin specific key material here (type: rsa | ecdsa | ed25519 - ed25519
 # alone is enough for identity purposes) to keep the same identity across
-# reprovisioning; same inline-value/path/url/secret_id choice as root_ca's
-# cert below (private_key / private_key_path / private_key_url /
-# private_key_secret_id, pick exactly one). The matching public key is
-# derived automatically - no need to supply it separately. Generate a key
-# to pin with e.g.:
+# reprovisioning; same inline-value/path/url/secret/secret_id choice as
+# root_ca's cert below (private_key / private_key_path / private_key_url /
+# private_key_secret / private_key_secret_id, pick exactly one). The matching
+# public key is derived automatically - no need to supply it separately.
+# Generate a key to pin with e.g.:
 #   ssh-keygen -t ed25519 -f ssh_host_ed25519_key -N ""
 ssh_server:
   enable: true
@@ -442,13 +466,21 @@ ssh_server:
         -----END OPENSSH PRIVATE KEY-----
       # private_key_path: C:\path\to\ssh_host_ed25519_key
       # private_key_url: https://example.com/ssh_host_ed25519_key
+      # private_key_secret:
+      #   source: bw
+      #   path: Lab/ssh-host-ed25519
+      #   field: private_key
       # private_key_secret_id: 00000000-0000-0000-0000-000000000000
   authorized_keys:
     - "ssh-ed25519 AAAA...replace-with-your-actual-public-key... your-comment"
     # Each entry is either a literal string like above, or a block map with
-    # key_secret_id fetched from Bitwarden Secrets Manager -
-    # handy for a shared/personal access key reused across machines
-    # instead of pasting the same key text into every config:
+    # key_secret (bw or bws) or key_secret_id (bws) - handy for a
+    # shared/personal access key reused across machines instead of pasting
+    # the same key text into every config:
+    # - key_secret:
+    #     source: bw
+    #     path: Personal/id_ed25519
+    #     field: public_key
     # - key_secret_id: 00000000-0000-0000-0000-000000000000
 
 # ----------------------------------------------------------------------------
@@ -457,7 +489,8 @@ ssh_server:
 # Install one or more root CA certificates. Each entry needs exactly one of
 # cert (inline PEM), cert_path (local file), cert_url (fetched, with
 # BOOTSTRAP_CONFIG_TOKEN sent only to the selected config URL origin
-# (scheme/host/port), not used to authenticate a different origin), or
+# (scheme/host/port), not used to authenticate a different origin),
+# cert_secret (structured Bitwarden secret map - bw or bws), or
 # cert_secret_id (a Bitwarden Secrets Manager secret ID - needs
 # secret_manager: bws above and $env:BWS_ACCESS_TOKEN set).
 # install: false skips just that one entry; use the block-map form shown at
@@ -471,6 +504,10 @@ root_ca:
       -----END CERTIFICATE-----
     # cert_path: C:\path\to\ca.pem
     # cert_url: https://example.com/ca.pem
+    # cert_secret:
+    #   source: bw
+    #   path: Certificates/my-corporate-root-ca
+    #   field: notes
     # cert_secret_id: 00000000-0000-0000-0000-000000000000
 
 # ----------------------------------------------------------------------------
@@ -629,13 +666,17 @@ kernel_debugging:
   #   # Omit to let Windows select it. Reconciled on reruns independently
   #   # of the key, e.g. when multiple NICs require an explicit choice.
   #   # bus_params: "2.0.0"
-  #   generate: true      # or key / key_path / key_url / key_secret_id - exactly one.
+  #   generate: true      # or key / key_path / key_url / key_secret / key_secret_id - exactly one.
   #                        # A generated key is only ever created once (like a generated
   #                        # local_users password) - shown once on the console, or written
   #                        # to kernel-debug-key.generated.txt next to the script if -Quiet.
   #   # key: "an-explicit-shared-secret"
   #   # key_path: C:\secrets\kernel-debug-key.txt
   #   # key_url: https://internal.example.com/kernel-debug-key.txt
+  #   # key_secret:
+  #   #   source: bw
+  #   #   path: Lab/kdnet-key
+  #   #   field: password
   #   # key_secret_id: 00000000-0000-0000-0000-000000000000
   #   # This key grants remote kernel debugging access - full control of the
   #   # machine - so treat it with at least as much care as a root CA
@@ -645,7 +686,7 @@ kernel_debugging:
 # windows_product_key
 # ----------------------------------------------------------------------------
 # Installs a Windows product key and requests online activation, via the
-# same WMI methods slmgr.vbs uses internally. Exactly one of the 4
+# same WMI methods slmgr.vbs uses internally. Exactly one of the 5
 # fields below. Windows never exposes a fully-installed key back out
 # (only its last 5 characters), so verification is a suffix comparison:
 # an already-activated machine whose installed key ends the same way is
@@ -655,6 +696,10 @@ kernel_debugging:
 # windows_product_key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
 # windows_product_key_path: C:\secrets\windows-key.txt
 # windows_product_key_url: https://internal.example.com/windows-key.txt
+# windows_product_key_secret:
+#   source: bw
+#   path: Licenses/Windows-11-Pro
+#   field: notes
 # windows_product_key_secret_id: 00000000-0000-0000-0000-000000000000
 
 # ----------------------------------------------------------------------------
@@ -740,6 +785,24 @@ power:
 #   peers:
 #     - ntp1.example.org
 #     - ntp2.example.org
+
+# ----------------------------------------------------------------------------
+# windows_update
+# ----------------------------------------------------------------------------
+# Optional Windows Update behavior configuration. Valid mode values:
+#   auto    - removes NoAutoUpdate/AUOptions policies, clears any pause
+#             window, and ensures wuauserv startup is Manual (default Windows
+#             automatic update state)
+#   manual  - sets NoAutoUpdate=1 and AUOptions=2 (suppresses background
+#             automatic updates while keeping manual checks available)
+#   pause   - sets NoAutoUpdate=1, AUOptions=2, and configures a 35-day
+#             feature/quality update pause window
+#   disable - sets NoAutoUpdate=1, stops wuauserv, and sets its startup type
+#             to Disabled
+# disabled (optional, default false) skips this whole section.
+# windows_update:
+#   mode: pause
+#   # disabled: true
 
 # ----------------------------------------------------------------------------
 # delete_bootstrap_user

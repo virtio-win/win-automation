@@ -48,15 +48,21 @@
     multi-document files are not supported.
 
     Fields that hold secret material (root_ca[].cert, ssh_server.
-    host_keys[].private_key, local_users[].password) also accept a
-    "_secret_id" source (cert_secret_id, private_key_secret_id,
-    password_secret_id) instead of an inline value/_path/_url - a secret
-    ID in Bitwarden Secrets Manager, fetched at run time via the bws CLI
-    (installed automatically on first use). Requires the top-level config
-    key "secret_manager: bws" (the only supported value today) and
-    $env:BWS_ACCESS_TOKEN to be set before running - using any
-    "_secret_id" field without "secret_manager" set is a config error,
-    caught by -ValidateConfig or the same pre-flight check on a real run.
+    host_keys[].private_key, local_users[].password, kernel_debugging.
+    network.key, windows_product_key, and ssh_server.authorized_keys /
+    local_users[].ssh_keys items) accept a structured "_secret" map
+    (cert_secret, private_key_secret, password_secret, key_secret,
+    windows_product_key_secret) or a legacy "_secret_id" field instead of
+    an inline value/_path/_url. Two Bitwarden sources are supported and can
+    be freely mixed in the same config:
+      - Bitwarden Password Manager CLI (source: bw, or top-level
+        secret_manager: bw): resolves items by vault path (<folder>/<item>
+        or <item>) and field (password, username, notes, public_key,
+        private_key, or custom:<FieldName>) via bw.exe.
+      - Bitwarden Secrets Manager (source: bws, top-level
+        secret_manager: bws, or *_secret_id): resolves secrets by UUID via
+        bws.exe (installed automatically on first use) using
+        $env:BWS_ACCESS_TOKEN.
 
 .PARAMETER ConfigPath
     Path to a local YAML config file. Mutually exclusive with -ConfigUrl.
@@ -139,6 +145,17 @@
     Prints "Config is valid." and exits 0, or lists every problem found
     and exits 1.
 
+.PARAMETER ResolveSecretsTo
+    Standalone, no-elevation secret pre-resolution mode: resolves, fetches,
+    parses, and statically validates the config, resolves every secret
+    from Bitwarden CLI (bw) and/or Bitwarden Secrets Manager (bws) into
+    inline config fields, removes secret_manager, and writes the resulting
+    YAML to the specified file path with restricted ACLs (SYSTEM,
+    Administrators, and current user), then exits 0. Useful on a host
+    machine to pre-resolve secrets into a temporary file before injecting
+    it into an isolated guest VM. Mutually exclusive with -Verify,
+    -ValidateConfig, -ShredConfig, -Only, and -Skip.
+
 .PARAMETER Only
     Run only the step(s) matching these tag(s), skipping everything else
     regardless of config (e.g. -Only ssh). Comma-separate for more than
@@ -154,8 +171,8 @@
     recovery_partition, vbs, onedrive, teams, outlook, defender, uac, apps,
     powershell7, windows_terminal, ssh, winssh_agent, computer_name,
     firewall, smb, local_users, first_login, sudo, crash_dump,
-    kernel_debugging, cleanup, product_key, power, network, privacy. Matching is
-    case-insensitive.
+    kernel_debugging, cleanup, product_key, power, network, privacy,
+    time_sync, windows_update. Matching is case-insensitive.
 
     If ssh_server.default_shell/windows_terminal.default_profile: pwsh7 is
     configured, -Only automatically pulls the "powershell7" tag back in
@@ -257,6 +274,7 @@ param(
     [switch]$Download,
     [switch]$Verify,
     [switch]$ValidateConfig,
+    [string]$ResolveSecretsTo,
     [string[]]$Only = @(),
     [string[]]$Skip = @(),
     [Alias('q')]
@@ -472,6 +490,14 @@ if ($ValidateConfig -and $ShredConfig) {
 if ($Verify -and $ShredConfig) {
     throw '-Verify and -ShredConfig are mutually exclusive; -Verify is read-only and never modifies or deletes files.'
 }
+if ($ResolveSecretsTo) {
+    if ($ValidateConfig -or $Verify -or $ShredConfig) {
+        throw '-ResolveSecretsTo is mutually exclusive with -ValidateConfig, -Verify, and -ShredConfig.'
+    }
+    if ($Only.Count -gt 0 -or $Skip.Count -gt 0) {
+        throw '-ResolveSecretsTo always resolves the whole config; it cannot be combined with -Only/-Skip.'
+    }
+}
 foreach ($t in ($Only + $Skip)) {
     if ($t -notin $script:KnownStepTags) {
         throw "Unknown tag '$t' in -Only/-Skip. Valid tags: $($script:KnownStepTags -join ', ')"
@@ -530,7 +556,8 @@ $script:ValidKernelDebugTargets = @('current', 'dedicated')
 $script:ValidKernelDebugTransports = @('serial', 'network')
 $script:ValidAppScopes = @('machine', 'user')
 $script:ValidArchitectures = @('arm64', 'x64')
-$script:ValidSecretManagers = @('bws')
+$script:ValidSecretManagers = @('bws', 'bw')
+$script:ValidBwSecretFields = @('password', 'username', 'notes', 'public_key', 'private_key')
 $script:ValidPrivacyModes = @('strict')
 $script:ValidAutologonModes = @('once', 'always', 'false')
 $script:ValidWindowsUpdateModes = @('auto', 'manual', 'pause', 'disable')
@@ -869,11 +896,8 @@ function Resolve-ConfigList {
 # (and more may be added later) - a hardcoded per-field list would itself
 # need manual upkeep every time a new one is added.
 function Find-ConfigSecretIdFields {
-    # Returns one [pscustomobject]@{ Path; Value } per '*_secret_id' field
-    # found - the path for error messages (see Test-BootstrapConfig below),
-    # the value so callers (see the Bitwarden Secrets Manager pre-flight
-    # check further down) can resolve an actual secret without a second
-    # config walk.
+    # Returns one [pscustomobject]@{ Path; Kind; Value } per '*_secret_id' or '*_secret'
+    # field found in the parsed config tree.
     param(
         $Node,
         [string]$Path = ''
@@ -882,15 +906,13 @@ function Find-ConfigSecretIdFields {
     if ($Node -is [System.Collections.IDictionary]) {
         foreach ($key in $Node.Keys) {
             $childPath = if ($Path) { "$Path.$key" } else { $key }
-            if ($key -like '*_secret_id' -and $Node[$key]) {
-                $found.Add([pscustomobject]@{ Path = $childPath; Value = $Node[$key] })
+            if ($key -like '*_secret_id' -and $null -ne $Node[$key] -and $Node[$key] -ne '') {
+                $found.Add([pscustomobject]@{ Path = $childPath; Kind = 'secret_id'; Value = $Node[$key] })
+            }
+            elseif ($key -like '*_secret' -and $null -ne $Node[$key] -and $Node[$key] -ne '') {
+                $found.Add([pscustomobject]@{ Path = $childPath; Kind = 'secret'; Value = $Node[$key] })
             }
             else {
-                # AddRange requires a strongly-typed IEnumerable[string] -
-                # the recursive call's return value is a loosely-typed
-                # System.Object[] (even though every element is a string),
-                # which AddRange rejects outright. A plain foreach+Add
-                # sidesteps that type-matching entirely.
                 foreach ($nested in (Find-ConfigSecretIdFields -Node $Node[$key] -Path $childPath)) {
                     $found.Add($nested)
                 }
@@ -906,10 +928,76 @@ function Find-ConfigSecretIdFields {
             $i++
         }
     }
-    # The leading comma prevents PowerShell from unrolling a 0/1-element
-    # array back into $null/a bare scalar when this return value is
-    # captured - same pitfall/fix used throughout this file.
     return , @($found)
+}
+
+function Test-SecretSpecValidity {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Kind,
+        $Value,
+        [string]$GlobalSecretManager,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.List[string]]$Problems
+    )
+    if ($Kind -eq 'secret_id') {
+        if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) {
+            $Problems.Add("${Path}: must be a non-empty secret UUID string.")
+        }
+        return
+    }
+
+    if ($Value -isnot [System.Collections.IDictionary]) {
+        $Problems.Add("${Path}: must be a map (for 'bw': { path, field, [source: bw] }; for 'bws': { id, [source: bws] }).")
+        return
+    }
+
+    $explicitSource = Get-ConfigValue $Value @('source')
+    $effectiveSource = if ($explicitSource) { ([string]$explicitSource).Trim().ToLowerInvariant() } elseif ($GlobalSecretManager) { ([string]$GlobalSecretManager).Trim().ToLowerInvariant() } else { '' }
+
+    if (-not $effectiveSource) {
+        $Problems.Add("${Path}: no 'source' specified on the secret and no top-level 'secret_manager' is set - set 'source: bw' or 'source: bws', or set top-level 'secret_manager'.")
+        return
+    }
+    if ($effectiveSource -notin $script:ValidSecretManagers) {
+        $Problems.Add("${Path}: invalid secret source '$effectiveSource' - must be one of: $($script:ValidSecretManagers -join ', ').")
+        return
+    }
+
+    if ($effectiveSource -eq 'bws') {
+        $idVal = Get-ConfigValue $Value @('id')
+        if (-not $idVal -or [string]::IsNullOrWhiteSpace([string]$idVal)) {
+            $Problems.Add("${Path} (source: bws): missing required 'id' (Bitwarden Secrets Manager UUID).")
+        }
+        if ((Get-ConfigValue $Value @('path')) -or (Get-ConfigValue $Value @('field'))) {
+            $Problems.Add("${Path} (source: bws): 'path' and 'field' are only valid for 'source: bw', not 'bws'.")
+        }
+    }
+    elseif ($effectiveSource -eq 'bw') {
+        $pathVal = Get-ConfigValue $Value @('path')
+        $fieldVal = Get-ConfigValue $Value @('field')
+        if (-not $pathVal -or [string]::IsNullOrWhiteSpace([string]$pathVal)) {
+            $Problems.Add("${Path} (source: bw): missing required 'path' (e.g. 'Folder/Subfolder/ItemName' or 'ItemName').")
+        }
+        else {
+            $segments = @(([string]$pathVal).Trim('/') -split '/')
+            if ($segments.Count -eq 0 -or @($segments | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+                $Problems.Add("${Path} (source: bw): invalid 'path' '$pathVal' - path segments must not be empty.")
+            }
+        }
+        if (-not $fieldVal -or [string]::IsNullOrWhiteSpace([string]$fieldVal)) {
+            $Problems.Add("${Path} (source: bw): missing required 'field' (one of: $($script:ValidBwSecretFields -join ', '), or 'custom:<FieldName>').")
+        }
+        else {
+            $fStr = ([string]$fieldVal).Trim()
+            $isCustom = $fStr.StartsWith('custom:', [System.StringComparison]::OrdinalIgnoreCase) -and $fStr.Length -gt 7
+            if (-not $isCustom -and $fStr.ToLowerInvariant() -notin $script:ValidBwSecretFields) {
+                $Problems.Add("${Path} (source: bw): invalid 'field' '$fStr' - must be one of: $($script:ValidBwSecretFields -join ', '), or 'custom:<FieldName>'.")
+            }
+        }
+        if (Get-ConfigValue $Value @('id')) {
+            $Problems.Add("${Path} (source: bw): 'id' is only valid for 'source: bws'; use 'path' and 'field' for 'bw'.")
+        }
+    }
 }
 
 # Maps a '_secret_id' field's path (as returned by Find-ConfigSecretIdFields
@@ -939,7 +1027,7 @@ function Get-SecretFieldTags {
     if ($Path -like 'kernel_debugging*') {
         return @('kernel_debugging')
     }
-    if ($Path -like 'windows_product_key_secret_id') {
+    if ($Path -like 'windows_product_key_secret*') {
         return @('product_key')
     }
     return @()
@@ -979,8 +1067,12 @@ function Test-BootstrapConfig {
         param([string]$Description, $Keys)
         for ($i = 0; $i -lt $Keys.Count; $i++) {
             $item = $Keys[$i]
-            if ($item -is [System.Collections.IDictionary] -and -not (Get-ConfigValue $item @('key_secret_id'))) {
-                $problems.Add("${Description}[$i]: a map entry must have a 'key_secret_id' key.")
+            if ($item -is [System.Collections.IDictionary]) {
+                $hasSecretId = [bool](Get-ConfigValue $item @('key_secret_id'))
+                $hasSecret = [bool](Get-ConfigValue $item @('key_secret'))
+                if ((-not $hasSecretId -and -not $hasSecret) -or ($hasSecretId -and $hasSecret)) {
+                    $problems.Add("${Description}[$i]: a map entry must specify exactly one of 'key_secret' or 'key_secret_id'.")
+                }
             }
         }
     }
@@ -1038,12 +1130,14 @@ function Test-BootstrapConfig {
     $winKeyPath = Get-ConfigValue $Config @('windows_product_key_path')
     $winKeyUrl = Get-ConfigValue $Config @('windows_product_key_url')
     $winKeySecretId = Get-ConfigValue $Config @('windows_product_key_secret_id')
-    if ($winKeyInline -or $winKeyPath -or $winKeyUrl -or $winKeySecretId) {
+    $winKeySecret = Get-ConfigValue $Config @('windows_product_key_secret')
+    if ($winKeyInline -or $winKeyPath -or $winKeyUrl -or $winKeySecretId -or $winKeySecret) {
         Test-ExactlyOneSource -Description 'windows_product_key' -Sources @{
             windows_product_key            = $winKeyInline
             windows_product_key_path       = $winKeyPath
             windows_product_key_url        = $winKeyUrl
             windows_product_key_secret_id  = $winKeySecretId
+            windows_product_key_secret     = $winKeySecret
         }
     }
     if ($winKeyInline -and $winKeyInline -notmatch '^[A-Za-z0-9]{5}(-[A-Za-z0-9]{5}){4}$') {
@@ -1062,6 +1156,7 @@ function Test-BootstrapConfig {
             cert_path       = Get-ConfigValue $entry @('cert_path')
             cert_url        = Get-ConfigValue $entry @('cert_url')
             cert_secret_id  = Get-ConfigValue $entry @('cert_secret_id')
+            cert_secret     = Get-ConfigValue $entry @('cert_secret')
         }
     }
 
@@ -1118,6 +1213,7 @@ function Test-BootstrapConfig {
             private_key_path       = Get-ConfigValue $hostKey @('private_key_path')
             private_key_url        = Get-ConfigValue $hostKey @('private_key_url')
             private_key_secret_id  = Get-ConfigValue $hostKey @('private_key_secret_id')
+            private_key_secret     = Get-ConfigValue $hostKey @('private_key_secret')
         }
     }
     Test-SshKeyListShape -Description 'ssh_server.authorized_keys' -Keys (Get-ConfigValue $Config @('ssh_server', 'authorized_keys') @())
@@ -1242,6 +1338,7 @@ function Test-BootstrapConfig {
             password_path       = Get-ConfigValue $entry @('password_path')
             password_url        = Get-ConfigValue $entry @('password_url')
             password_secret_id  = Get-ConfigValue $entry @('password_secret_id')
+            password_secret     = Get-ConfigValue $entry @('password_secret')
             generate            = Get-ConfigValue $entry @('generate') $false
             ask                 = Get-ConfigValue $entry @('ask') $false
         }
@@ -1305,18 +1402,22 @@ function Test-BootstrapConfig {
             key_path      = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_path')
             key_url       = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_url')
             key_secret_id = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_secret_id')
+            key_secret    = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_secret')
             generate      = Get-ConfigValue $Config @('kernel_debugging', 'network', 'generate') $false
         }
     }
 
-    # secret_manager / _secret_id consistency
+    # secret_manager / _secret / _secret_id consistency
     $secretManager = Get-ConfigValue $Config @('secret_manager')
     if ($secretManager -and $secretManager -notin $script:ValidSecretManagers) {
         $problems.Add("'secret_manager' is set to '$secretManager', which is not supported - must be one of: $($script:ValidSecretManagers -join ', ').")
     }
-    $secretIdFields = Find-ConfigSecretIdFields -Node $Config
-    if ($secretIdFields.Count -gt 0 -and $secretManager -notin $script:ValidSecretManagers) {
-        $problems.Add("Config uses '_secret_id' at $($secretIdFields.Path -join ', '), but 'secret_manager' is not set to a supported value ('bws' is the only one supported today) - add 'secret_manager: bws' at the top level.")
+    $secretFields = Find-ConfigSecretIdFields -Node $Config
+    foreach ($sf in $secretFields) {
+        if ($sf.Kind -eq 'secret_id' -and $secretManager -notin $script:ValidSecretManagers) {
+            $problems.Add("Config uses '_secret_id' at $($sf.Path), but 'secret_manager' is not set to a supported value ($($script:ValidSecretManagers -join ', ')) - add 'secret_manager: bws' at the top level or use '_secret: { source: bws, id: ... }'.")
+        }
+        Test-SecretSpecValidity -Path $sf.Path -Kind $sf.Kind -Value $sf.Value -GlobalSecretManager $secretManager -Problems $problems
     }
 
     return , @($problems)
@@ -1690,12 +1791,40 @@ function Remove-BootstrapFileSecurely {
     Write-Host "Securely shredded and deleted config file '$fullPath'." -ForegroundColor Cyan
 }
 
+function Resolve-SecretSpecValue {
+    param(
+        $SecretSpec,
+        [string]$SecretIdValue,
+        [Parameter(Mandatory)] [string]$Description
+    )
+    if ($SecretIdValue) {
+        return Get-BwsSecretValue -SecretId $SecretIdValue
+    }
+    if ($null -eq $SecretSpec -or $SecretSpec -isnot [System.Collections.IDictionary]) {
+        throw "${Description}: invalid secret specification."
+    }
+    $globalSm = if ($null -ne $Config) { Get-ConfigValue $Config @('secret_manager') } else { $null }
+    $explicitSource = Get-ConfigValue $SecretSpec @('source')
+    $effectiveSource = if ($explicitSource) { ([string]$explicitSource).Trim().ToLowerInvariant() } elseif ($globalSm) { ([string]$globalSm).Trim().ToLowerInvariant() } else { '' }
+    if ($effectiveSource -eq 'bws') {
+        $id = [string](Get-ConfigValue $SecretSpec @('id'))
+        return Get-BwsSecretValue -SecretId $id
+    }
+    elseif ($effectiveSource -eq 'bw') {
+        $path = [string](Get-ConfigValue $SecretSpec @('path'))
+        $field = [string](Get-ConfigValue $SecretSpec @('field'))
+        return Get-BwSecretValue -Path $path -Field $field -Description $Description
+    }
+    throw "${Description}: unsupported secret source '$effectiveSource'."
+}
+
 function Resolve-ConfigResource {
     param(
         $InlineValue,
         [string]$PathValue,
         [string]$UrlValue,
         [string]$SecretIdValue,
+        $SecretValue,
         [Parameter(Mandatory)] [string]$Description
     )
     $providedCount = 0
@@ -1703,8 +1832,9 @@ function Resolve-ConfigResource {
     if ($PathValue) { $providedCount++ }
     if ($UrlValue) { $providedCount++ }
     if ($SecretIdValue) { $providedCount++ }
+    if ($SecretValue) { $providedCount++ }
     if ($providedCount -gt 1) {
-        throw "${Description}: specify only one of an inline value, a path, a url, or a secret_id."
+        throw "${Description}: specify only one of an inline value, a path, a url, a secret_id, or a secret."
     }
 
     if ($InlineValue) {
@@ -1719,10 +1849,10 @@ function Resolve-ConfigResource {
     if ($UrlValue) {
         return Get-ConfigText -Source ([pscustomobject]@{ Kind = 'Url'; Value = $UrlValue })
     }
-    if ($SecretIdValue) {
-        return Get-BwsSecretValue -SecretId $SecretIdValue
+    if ($SecretIdValue -or $SecretValue) {
+        return Resolve-SecretSpecValue -SecretSpec $SecretValue -SecretIdValue $SecretIdValue -Description $Description
     }
-    throw "${Description}: no inline value, path, url, or secret_id provided."
+    throw "${Description}: no inline value, path, url, secret_id, or secret provided."
 }
 
 # ssh_server.authorized_keys and local_users[].ssh_keys are lists where
@@ -1740,22 +1870,18 @@ function Resolve-SshKeyList {
             $resolved.Add($item)
         }
         elseif ($item -is [System.Collections.IDictionary]) {
-            $secretId = $item['key_secret_id']
-            if (-not $secretId) {
-                throw "ssh key list entry is a map but has no 'key_secret_id' key."
+            $secretId = Get-ConfigValue $item @('key_secret_id')
+            $secretSpec = Get-ConfigValue $item @('key_secret')
+            if (-not $secretId -and -not $secretSpec) {
+                throw "ssh key list entry is a map but has neither 'key_secret' nor 'key_secret_id'."
             }
-            # .Trim() guards against a trailing newline in the fetched
-            # secret value breaking the exact-string matching/writing
-            # done by callers.
-            $resolved.Add((Get-BwsSecretValue -SecretId $secretId).Trim())
+            $val = Resolve-SecretSpecValue -SecretSpec $secretSpec -SecretIdValue $secretId -Description 'ssh key list entry'
+            $resolved.Add($val.Trim())
         }
         else {
             throw "ssh key list entry has an unsupported type: $($item.GetType().Name)."
         }
     }
-    # The leading comma prevents PowerShell from unrolling a 0/1-element
-    # array into $null/a bare scalar when this return value is captured -
-    # same pitfall/fix used throughout this file.
     return , @($resolved)
 }
 
@@ -1803,6 +1929,13 @@ $script:BwsExePath = Join-Path $script:BwsInstallDir 'bws.exe'
 function Install-BwsCli {
     if (Test-Path $script:BwsExePath) {
         return $script:BwsExePath
+    }
+    $bwsCmd = Get-Command 'bws.exe' -ErrorAction SilentlyContinue
+    if (-not $bwsCmd) {
+        $bwsCmd = Get-Command 'bws' -ErrorAction SilentlyContinue
+    }
+    if ($bwsCmd) {
+        return $bwsCmd.Source
     }
 
     # Never installs anything under -Verify - this genuinely would be a
@@ -1873,26 +2006,31 @@ function Install-BwsCli {
             throw "bws.exe not found inside '$($zipAsset.name)' after extraction."
         }
 
-        if (-not (Test-Path $script:BwsInstallDir)) {
-            New-Item -Path $script:BwsInstallDir -ItemType Directory -Force | Out-Null
+        $targetDir = if (Test-IsAdmin) { $script:BwsInstallDir } else { Join-Path $env:LOCALAPPDATA 'bws' }
+        $targetExe = Join-Path $targetDir 'bws.exe'
+        if (-not (Test-Path $targetDir)) {
+            New-Item -Path $targetDir -ItemType Directory -Force | Out-Null
         }
-        Copy-Item -Path $extractedExe.FullName -Destination $script:BwsExePath -Force
+        Copy-Item -Path $extractedExe.FullName -Destination $targetExe -Force
+        $script:BwsInstallDir = $targetDir
+        $script:BwsExePath = $targetExe
         Write-Host "bws CLI ($($release.tag_name), $archToken) installed to '$script:BwsExePath'."
     }
     finally {
         Remove-Item -Path $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # Add to the machine PATH, idempotently, so bws is also usable as a
-    # normal command afterward - not just invoked internally by this
-    # script.
-    $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    # Add to the machine (or user, when non-elevated under -ResolveSecretsTo)
+    # PATH, idempotently, so bws is also usable as a normal command afterward -
+    # not just invoked internally by this script.
+    $pathScope = if (Test-IsAdmin) { 'Machine' } else { 'User' }
+    $currentPath = [Environment]::GetEnvironmentVariable('Path', $pathScope)
     $pathEntries = $currentPath -split ';' | Where-Object { $_ }
     $alreadyOnPath = $pathEntries | Where-Object { $_.TrimEnd('\') -ieq $script:BwsInstallDir.TrimEnd('\') }
     if (-not $alreadyOnPath) {
         $newPath = ($pathEntries + $script:BwsInstallDir) -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'Machine')
-        Write-Host "Added '$script:BwsInstallDir' to the machine PATH (open a new shell to use 'bws' directly)."
+        [Environment]::SetEnvironmentVariable('Path', $newPath, $pathScope)
+        Write-Host "Added '$script:BwsInstallDir' to the $($pathScope.ToLowerInvariant()) PATH (open a new shell to use 'bws' directly)."
     }
 
     return $script:BwsExePath
@@ -1927,6 +2065,263 @@ function Get-BwsSecretValue {
     $value = ($output | ConvertFrom-Json).value
     $script:BwsSecretCache[$SecretId] = $value
     return $value
+}
+
+$script:BwVaultLoaded = $false
+$script:BwFoldersById = @{}
+$script:BwItems = @()
+$script:BwUnlockedByThisRun = $false
+$script:BwExePath = $null
+
+function Get-BwCliPath {
+    if ($script:BwExePath -and (Test-Path -LiteralPath $script:BwExePath)) {
+        return $script:BwExePath
+    }
+    $cmd = Get-Command 'bw.exe' -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        $cmd = Get-Command 'bw' -ErrorAction SilentlyContinue
+    }
+    if (-not $cmd -and $env:PATH -like '*WindowsPowerShell*') {
+        # Refresh missing entries from Machine and User PATH in case Bitwarden.CLI
+        # was installed via winget in the current session without restarting the shell.
+        $currentEntries = @($env:PATH -split ';' | Where-Object { $_ })
+        $regEntries = @(
+            ([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';'),
+            ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';')
+        ) | ForEach-Object { $_ } | Where-Object { $_ }
+        foreach ($entry in $regEntries) {
+            if (-not ($currentEntries | Where-Object { $_.TrimEnd('\') -ieq $entry.TrimEnd('\') })) {
+                $currentEntries += $entry
+            }
+        }
+        $env:PATH = $currentEntries -join ';'
+        $cmd = Get-Command 'bw.exe' -ErrorAction SilentlyContinue
+        if (-not $cmd) {
+            $cmd = Get-Command 'bw' -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $cmd) {
+        throw "Bitwarden CLI ('bw.exe') is not installed or not on PATH. Install Bitwarden CLI before using 'source: bw' or 'secret_manager: bw'."
+    }
+    $script:BwExePath = $cmd.Source
+    return $script:BwExePath
+}
+
+function Initialize-BwVaultCache {
+    if ($script:BwVaultLoaded) { return }
+
+    $bwExe = Get-BwCliPath
+
+    # bw natively reads $env:BW_SESSION from the environment; avoid passing
+    # --session on the command line so the session key is never exposed in
+    # child-process arguments.
+    $statusRaw = & {
+        $ErrorActionPreference = 'Continue'
+        & $bwExe status --nointeraction 2>&1
+    }
+    $statusObj = $null
+    try {
+        $statusStdout = (@($statusRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
+        $statusText = if ($statusStdout) { $statusStdout } else { ($statusRaw | Out-String).Trim() }
+        if ($statusText -match '\{.*\}') {
+            $statusObj = $Matches[0] | ConvertFrom-Json
+        }
+    } catch { }
+
+    $vaultStatus = if ($statusObj -and $statusObj.PSObject.Properties['status']) { [string]$statusObj.status } else { 'unknown' }
+
+    if ($vaultStatus -eq 'unauthenticated') {
+        if ($Quiet -or -not [Environment]::UserInteractive) {
+            throw "Bitwarden CLI is not logged in (status: unauthenticated). Run 'bw login' interactively first, or run without -Quiet."
+        }
+        Remove-Item Env:\BW_SESSION -ErrorAction SilentlyContinue
+        Write-Host 'Bitwarden CLI is unauthenticated. Starting interactive login (enter email, master password, and 2FA code if prompted)...' -ForegroundColor Cyan
+        $sessionToken = (& $bwExe login --raw) | Out-String
+        $sessionToken = $sessionToken.Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sessionToken)) {
+            throw "Bitwarden interactive 'bw login' failed or did not return a session token."
+        }
+        $env:BW_SESSION = $sessionToken
+        $script:BwUnlockedByThisRun = $true
+    }
+    elseif ($vaultStatus -eq 'locked') {
+        if ($Quiet -or -not [Environment]::UserInteractive) {
+            throw "Bitwarden vault is locked and `$env:BW_SESSION is not valid. Run 'bw unlock' first, or run without -Quiet to be prompted for your master password."
+        }
+        Remove-Item Env:\BW_SESSION -ErrorAction SilentlyContinue
+        Write-Host 'Bitwarden vault is locked. Enter your Bitwarden master password to unlock for this run:' -ForegroundColor Cyan
+        $sessionToken = (& $bwExe unlock --raw) | Out-String
+        $sessionToken = $sessionToken.Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sessionToken)) {
+            throw "Bitwarden 'bw unlock' failed or did not return a session token."
+        }
+        $env:BW_SESSION = $sessionToken
+        $script:BwUnlockedByThisRun = $true
+    }
+    elseif ($vaultStatus -ne 'unlocked') {
+        throw "Unexpected Bitwarden CLI status '$vaultStatus' (output: $statusRaw)."
+    }
+
+    Write-Host 'Synchronizing Bitwarden vault (bw sync)...' -ForegroundColor Cyan
+    $syncOut = & {
+        $ErrorActionPreference = 'Continue'
+        & $bwExe sync --nointeraction 2>&1
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bitwarden 'bw sync' failed (exit $LASTEXITCODE): $syncOut"
+    }
+
+    $foldersRaw = & {
+        $ErrorActionPreference = 'Continue'
+        & $bwExe list folders --nointeraction 2>&1
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bitwarden 'bw list folders' failed (exit $LASTEXITCODE): $foldersRaw"
+    }
+    $foldersJson = (@($foldersRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
+    if ($foldersJson -match '(?s)\[.*\]') {
+        $foldersJson = $Matches[0]
+    }
+    $parsedFolders = $foldersJson | ConvertFrom-Json; $foldersList = if ($null -eq $parsedFolders) { @() } else { @($parsedFolders) }
+    $script:BwFoldersById = @{}
+    foreach ($f in $foldersList) {
+        if ($null -ne $f -and $null -ne $f.id) {
+            $script:BwFoldersById[[string]$f.id] = [string]$f.name
+        }
+    }
+
+    $itemsRaw = & {
+        $ErrorActionPreference = 'Continue'
+        & $bwExe list items --nointeraction 2>&1
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bitwarden 'bw list items' failed (exit $LASTEXITCODE): $itemsRaw"
+    }
+    $itemsJson = (@($itemsRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
+    if ($itemsJson -match '(?s)\[.*\]') {
+        $itemsJson = $Matches[0]
+    }
+    $parsedItems = $itemsJson | ConvertFrom-Json; $script:BwItems = if ($null -eq $parsedItems) { @() } else { @($parsedItems) }
+    $script:BwVaultLoaded = $true
+}
+
+function Close-BwSessionIfOwned {
+    if ($script:BwUnlockedByThisRun) {
+        try {
+            $bwExe = Get-BwCliPath
+            & {
+                $ErrorActionPreference = 'Continue'
+                & $bwExe lock --nointeraction 2>&1 | Out-Null
+            }
+        } catch { }
+        Remove-Item Env:\BW_SESSION -ErrorAction SilentlyContinue
+        $script:BwUnlockedByThisRun = $false
+        $script:BwVaultLoaded = $false
+        $script:BwItems = @()
+        $script:BwFoldersById = @{}
+        Write-Host 'Locked Bitwarden vault (session was opened by this run).' -ForegroundColor Cyan
+    }
+}
+
+function Get-BwSecretValue {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Field,
+        [Parameter(Mandatory)] [string]$Description
+    )
+    Initialize-BwVaultCache
+
+    $trimmedPath = $Path.Trim()
+    $normalized = $trimmedPath.TrimStart('/')
+    $segments = @($normalized -split '/')
+    if ($segments.Count -eq 0 -or [string]::IsNullOrWhiteSpace($segments[-1])) {
+        throw "${Description}: invalid Bitwarden path '$Path'."
+    }
+
+    $itemName = $segments[-1]
+    $folderPath = if ($segments.Count -gt 1) { ($segments[0..($segments.Count - 2)] -join '/') } else { '' }
+
+    # Match folder ID(s)
+    $matchingItems = @()
+    foreach ($item in $script:BwItems) {
+        if ($null -eq $item -or [string]$item.name -cne $itemName) { continue }
+        $itemFolderId = if ($item.PSObject.Properties['folderId']) { $item.folderId } else { $null }
+        if ($folderPath -eq '') {
+            if ($null -eq $itemFolderId -or [string]$itemFolderId -eq '') {
+                $matchingItems += $item
+            }
+        }
+        else {
+            if ($null -ne $itemFolderId -and $script:BwFoldersById.ContainsKey([string]$itemFolderId)) {
+                $fName = $script:BwFoldersById[[string]$itemFolderId]
+                if ($fName -ceq $folderPath) {
+                    $matchingItems += $item
+                }
+            }
+        }
+    }
+
+    if ($matchingItems.Count -eq 0) {
+        $folderDesc = if ($folderPath -eq '') { '<root (no folder)>' } else { "folder '$folderPath'" }
+        if ($folderPath -ne '' -and ($script:BwFoldersById.Values -cnotcontains $folderPath)) {
+            throw "${Description}: Bitwarden folder '$folderPath' not found in vault (path: '$Path')."
+        }
+        throw "${Description}: Bitwarden item '$itemName' not found in $folderDesc (path: '$Path')."
+    }
+    if ($matchingItems.Count -gt 1) {
+        throw "${Description}: found $($matchingItems.Count) duplicate Bitwarden items matching path '$Path' - item names within the same folder must be unique."
+    }
+
+    $targetItem = $matchingItems[0]
+    $fTrim = $Field.Trim()
+    $extracted = $null
+
+    if ($fTrim.StartsWith('custom:', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $customName = $fTrim.Substring(7)
+        $fieldsArr = if ($targetItem.PSObject.Properties['fields'] -and $null -ne $targetItem.fields) { @($targetItem.fields) } else { @() }
+        $matchedFields = @($fieldsArr | Where-Object { $null -ne $_ -and [string]$_.name -ceq $customName })
+        if ($matchedFields.Count -eq 0) {
+            throw "${Description}: custom field '$customName' not found on Bitwarden item '$Path'."
+        }
+        $extracted = [string]$matchedFields[0].value
+    }
+    else {
+        switch ($fTrim.ToLowerInvariant()) {
+            'password' {
+                if ($targetItem.PSObject.Properties['login'] -and $null -ne $targetItem.login -and $targetItem.login.PSObject.Properties['password']) {
+                    $extracted = [string]$targetItem.login.password
+                }
+            }
+            'username' {
+                if ($targetItem.PSObject.Properties['login'] -and $null -ne $targetItem.login -and $targetItem.login.PSObject.Properties['username']) {
+                    $extracted = [string]$targetItem.login.username
+                }
+            }
+            'notes' {
+                if ($targetItem.PSObject.Properties['notes']) {
+                    $extracted = [string]$targetItem.notes
+                }
+            }
+            'public_key' {
+                if ($targetItem.PSObject.Properties['sshKey'] -and $null -ne $targetItem.sshKey -and $targetItem.sshKey.PSObject.Properties['publicKey']) {
+                    $extracted = [string]$targetItem.sshKey.publicKey
+                }
+            }
+            'private_key' {
+                if ($targetItem.PSObject.Properties['sshKey'] -and $null -ne $targetItem.sshKey -and $targetItem.sshKey.PSObject.Properties['privateKey']) {
+                    $extracted = [string]$targetItem.sshKey.privateKey
+                }
+            }
+            default {
+                throw "${Description}: unsupported Bitwarden field '$Field' for '$Path'."
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($extracted)) {
+        throw "${Description}: field '$Field' on Bitwarden item '$Path' is missing or empty."
+    }
+    return $extracted
 }
 
 # ----------------------------------------------------------------------------
@@ -3435,6 +3830,218 @@ if ($ValidateConfig) {
     exit 1
 }
 
+function Format-BootstrapYamlScalarForOutput {
+    param($Value)
+    if ($null -eq $Value) { return "''" }
+    if ($Value -is [bool]) {
+        return $(if ($Value) { 'true' } else { 'false' })
+    }
+    $str = [string]$Value
+    if ($str -eq '') { return "''" }
+    if ($str -match '^(true|false|yes|no)$' -or
+        $str -match '[#''"\r\n:]' -or
+        $str -match '^\s|\s$' -or
+        $str.StartsWith('-') -or
+        $str.StartsWith('[')) {
+        return "'" + $str.Replace("'", "''") + "'"
+    }
+    return $str
+}
+
+function Write-BootstrapYamlNodeForOutput {
+    param(
+        [Parameter(Mandatory)] $Node,
+        [Parameter(Mandatory)] [int]$Indent,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.List[string]]$Lines
+    )
+    $pad = ' ' * $Indent
+    if ($Node -is [System.Collections.IDictionary]) {
+        foreach ($key in $Node.Keys) {
+            $val = $Node[$key]
+            if ($null -eq $val) { continue }
+            if ($val -is [System.Collections.IDictionary]) {
+                if ($val.Count -eq 0) { continue }
+                $Lines.Add("${pad}${key}:")
+                Write-BootstrapYamlNodeForOutput -Node $val -Indent ($Indent + 2) -Lines $Lines
+            }
+            elseif ($val -is [System.Collections.IList] -and $val -isnot [string]) {
+                if ($val.Count -eq 0) { continue }
+                $Lines.Add("${pad}${key}:")
+                Write-BootstrapYamlNodeForOutput -Node $val -Indent ($Indent + 2) -Lines $Lines
+            }
+            else {
+                $strVal = [string]$val
+                if ($strVal.Contains("`n")) {
+                    $Lines.Add("${pad}${key}: |")
+                    $blockPad = ' ' * ($Indent + 2)
+                    foreach ($bLine in ($strVal -split "`r?`n")) {
+                        $Lines.Add("${blockPad}${bLine}")
+                    }
+                }
+                else {
+                    $Lines.Add("${pad}${key}: $(Format-BootstrapYamlScalarForOutput $val)")
+                }
+            }
+        }
+    }
+    elseif ($Node -is [System.Collections.IList] -and $Node -isnot [string]) {
+        foreach ($item in $Node) {
+            if ($null -eq $item) { continue }
+            if ($item -is [System.Collections.IDictionary]) {
+                $keys = @($item.Keys)
+                if ($keys.Count -eq 0) { continue }
+                $firstKey = $keys[0]
+                $firstVal = $item[$firstKey]
+                if ($firstVal -is [System.Collections.IDictionary] -or ($firstVal -is [System.Collections.IList] -and $firstVal -isnot [string])) {
+                    $Lines.Add("${pad}- ${firstKey}:")
+                    Write-BootstrapYamlNodeForOutput -Node $firstVal -Indent ($Indent + 4) -Lines $Lines
+                }
+                elseif (([string]$firstVal).Contains("`n")) {
+                    $Lines.Add("${pad}- ${firstKey}: |")
+                    $blockPad = ' ' * ($Indent + 4)
+                    foreach ($bLine in (([string]$firstVal) -split "`r?`n")) {
+                        $Lines.Add("${blockPad}${bLine}")
+                    }
+                }
+                else {
+                    $Lines.Add("${pad}- ${firstKey}: $(Format-BootstrapYamlScalarForOutput $firstVal)")
+                }
+                for ($kIdx = 1; $kIdx -lt $keys.Count; $kIdx++) {
+                    $subKey = $keys[$kIdx]
+                    $subVal = $item[$subKey]
+                    if ($null -eq $subVal) { continue }
+                    $subMap = [ordered]@{ $subKey = $subVal }
+                    Write-BootstrapYamlNodeForOutput -Node $subMap -Indent ($Indent + 2) -Lines $Lines
+                }
+            }
+            else {
+                $Lines.Add("${pad}- $(Format-BootstrapYamlScalarForOutput $item)")
+            }
+        }
+    }
+}
+
+if ($ResolveSecretsTo) {
+    $configUrlForAuth = if ($ConfigUrl) { $ConfigUrl } else { $env:BOOTSTRAP_CONFIG_URL }
+    if ($configUrlForAuth) {
+        $script:ConfigAuthOrigin = Get-UrlOrigin -Url $configUrlForAuth
+    }
+    $configText = Get-BootstrapConfigSourceText -ConfigPath $ConfigPath -ConfigUrl $ConfigUrl `
+        -ConfigUrlInsecureSkipCertCheck:$ConfigUrlInsecureSkipCertCheck -Download:$Download -Quiet:$Quiet
+
+    if ([string]::IsNullOrWhiteSpace($configText)) {
+        throw 'Cannot resolve secrets: config is empty.'
+    }
+    $Config = ConvertFrom-BootstrapYaml -Text $configText
+
+    $installPowershell7Config = Get-ConfigValue $Config @('install_powershell7')
+    $windowsTerminalWantsPowershell7 = (Get-ConfigValue $Config @('windows_terminal', 'default_profile')) -eq 'pwsh7'
+    $sshWantsPowershell7 = (Get-ConfigValue $Config @('ssh_server', 'enable') $false) -and
+        ((Get-ConfigValue $Config @('ssh_server', 'default_shell')) -eq 'pwsh7')
+    $powershell7Dependents = @()
+    if ($windowsTerminalWantsPowershell7) { $powershell7Dependents += 'windows_terminal.default_profile: pwsh7' }
+    if ($sshWantsPowershell7) { $powershell7Dependents += 'ssh_server.default_shell: pwsh7' }
+
+    Assert-ConfigNoConflicts -Config $Config -InstallPowershell7Config $installPowershell7Config -Powershell7Dependents $powershell7Dependents
+
+    $baseDir = if ($script:ResolvedConfigSource -and $script:ResolvedConfigSource.Kind -eq 'Path') {
+        Split-Path -Parent ([System.IO.Path]::GetFullPath($script:ResolvedConfigSource.Value))
+    } else {
+        (Get-Location).Path
+    }
+
+    function Resolve-TreeSecretsAndLocalPaths {
+        param($Node, [string]$NodePath = '')
+        if ($null -eq $Node) { return }
+        if ($Node -is [System.Collections.IDictionary]) {
+            $keys = @($Node.Keys)
+            foreach ($k in $keys) {
+                $kStr = [string]$k
+                $curPath = if ($NodePath) { "$NodePath.$kStr" } else { $kStr }
+                if ($kStr -like '*_secret_id') {
+                    $targetKey = $kStr.Substring(0, $kStr.Length - '_secret_id'.Length)
+                    $val = Resolve-SecretSpecValue -SecretIdValue ([string]$Node[$k]) -Description $curPath
+                    $Node[$targetKey] = $val
+                    $Node.Remove($k)
+                }
+                elseif ($kStr -like '*_secret') {
+                    $targetKey = $kStr.Substring(0, $kStr.Length - '_secret'.Length)
+                    $val = Resolve-SecretSpecValue -SecretSpec $Node[$k] -Description $curPath
+                    $Node[$targetKey] = $val
+                    $Node.Remove($k)
+                }
+                elseif ($kStr -in @('password_path', 'cert_path', 'private_key_path', 'key_path', 'windows_product_key_path')) {
+                    $targetKey = $kStr.Substring(0, $kStr.Length - '_path'.Length)
+                    $rawPath = [string]$Node[$k]
+                    $fullFile = if ([System.IO.Path]::IsPathRooted($rawPath)) { $rawPath } else { Join-Path $baseDir $rawPath }
+                    if (-not (Test-Path -LiteralPath $fullFile -PathType Leaf)) {
+                        throw "${curPath}: local file not found at '$fullFile'."
+                    }
+                    $fileContent = (Get-Content -LiteralPath $fullFile -Raw -Encoding UTF8)
+                    if ($targetKey -in @('password', 'key', 'windows_product_key')) {
+                        $fileContent = $fileContent.TrimEnd("`r", "`n")
+                    }
+                    $Node[$targetKey] = $fileContent
+                    $Node.Remove($k)
+                }
+                else {
+                    $child = $Node[$k]
+                    if ($child -is [System.Collections.IList] -and $child -isnot [string]) {
+                        for ($idx = 0; $idx -lt $child.Count; $idx++) {
+                            $elem = $child[$idx]
+                            if ($elem -is [System.Collections.IDictionary] -and ($elem.Contains('key_secret_id') -or $elem.Contains('key_secret'))) {
+                                $sid = Get-ConfigValue $elem @('key_secret_id')
+                                $sspec = Get-ConfigValue $elem @('key_secret')
+                                $child[$idx] = (Resolve-SecretSpecValue -SecretSpec $sspec -SecretIdValue $sid -Description "${curPath}[$idx]").Trim()
+                            }
+                            else {
+                                Resolve-TreeSecretsAndLocalPaths -Node $elem -NodePath "${curPath}[$idx]"
+                            }
+                        }
+                    }
+                    else {
+                        Resolve-TreeSecretsAndLocalPaths -Node $child -NodePath $curPath
+                    }
+                }
+            }
+        }
+        elseif ($Node -is [System.Collections.IList] -and $Node -isnot [string]) {
+            for ($idx = 0; $idx -lt $Node.Count; $idx++) {
+                Resolve-TreeSecretsAndLocalPaths -Node $Node[$idx] -NodePath "${NodePath}[$idx]"
+            }
+        }
+    }
+
+    try {
+        Resolve-TreeSecretsAndLocalPaths -Node $Config
+        if ($Config.Contains('secret_manager')) {
+            $Config.Remove('secret_manager')
+        }
+        $outLines = [System.Collections.Generic.List[string]]::new()
+        Write-BootstrapYamlNodeForOutput -Node $Config -Indent 0 -Lines $outLines
+        $renderedYaml = ($outLines -join "`r`n")
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($ResolveSecretsTo, $renderedYaml, $utf8NoBom)
+        try {
+            $acl = New-Object System.Security.AccessControl.FileSecurity
+            $acl.SetAccessRuleProtection($true, $false)
+            $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $currentUserSid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            $acl.AddAccessRule($rule)
+            Set-Acl -LiteralPath $ResolveSecretsTo -AclObject $acl
+        } catch { }
+        Write-Host "Resolved configuration written to '$ResolveSecretsTo'." -ForegroundColor Green
+        exit 0
+    }
+    finally {
+        Close-BwSessionIfOwned
+    }
+}
+
 # ----------------------------------------------------------------------------
 # 1. Elevation gate
 # ----------------------------------------------------------------------------
@@ -3590,28 +4197,20 @@ if ($ShredConfig) {
 # -Only power would needlessly fail on an unrelated expired token for a
 # secret none of the selected steps would ever touch.
 if (-not $script:VerifyMode) {
-    $secretManagerForPreflight = Get-ConfigValue $Config @('secret_manager')
-    if ($secretManagerForPreflight -eq 'bws') {
-        # Captured into a variable before piping, deliberately: piping
-        # Find-ConfigSecretIdFields's call directly into Where-Object instead
-        # bypasses its leading-comma return trick (see that function's
-        # comment) and hands Where-Object the whole array as a single $_,
-        # not one element at a time - confirmed live, $_.Path then becomes a
-        # multi-value array instead of a string and blows up the
-        # Get-SecretFieldTags call below.
-        $allSecretFieldsForPreflight = Find-ConfigSecretIdFields -Node $Config
-        $reachableSecretFieldsForPreflight = @($allSecretFieldsForPreflight |
-            Where-Object { Test-TagActive -Tag (Get-SecretFieldTags -Path $_.Path) })
-        if ($reachableSecretFieldsForPreflight.Count -gt 0) {
-            Write-Host "Verifying Bitwarden Secrets Manager access ($($reachableSecretFieldsForPreflight.Count) secret(s) reachable by this run)..." -ForegroundColor Cyan
-            try {
-                Get-BwsSecretValue -SecretId $reachableSecretFieldsForPreflight[0].Value | Out-Null
+    $allSecretFieldsForPreflight = Find-ConfigSecretIdFields -Node $Config
+    $reachableSecretFieldsForPreflight = @($allSecretFieldsForPreflight |
+        Where-Object { Test-TagActive -Tag (Get-SecretFieldTags -Path $_.Path) })
+    if ($reachableSecretFieldsForPreflight.Count -gt 0) {
+        Write-Host "Verifying secret manager access ($($reachableSecretFieldsForPreflight.Count) secret(s) reachable by this run)..." -ForegroundColor Cyan
+        foreach ($sf in $reachableSecretFieldsForPreflight) {
+            if ($sf.Kind -eq 'secret_id') {
+                Get-BwsSecretValue -SecretId ([string]$sf.Value) | Out-Null
             }
-            catch {
-                throw "Bitwarden Secrets Manager access check failed before making any changes to this machine - $($_.Exception.Message) Verify `$env:BWS_ACCESS_TOKEN is correct, then re-run bootstrap."
+            else {
+                Resolve-SecretSpecValue -SecretSpec $sf.Value -Description $sf.Path | Out-Null
             }
-            Write-Host 'Bitwarden Secrets Manager access verified.' -ForegroundColor Cyan
         }
+        Write-Host 'Secret manager access verified.' -ForegroundColor Cyan
     }
 }
 
@@ -3697,6 +4296,7 @@ else {
                 $passwordPath = Get-ConfigValue $entry @('password_path')
                 $passwordUrl = Get-ConfigValue $entry @('password_url')
                 $passwordSecretId = Get-ConfigValue $entry @('password_secret_id')
+                $passwordSecret = Get-ConfigValue $entry @('password_secret')
                 $sourceCount = 0
                 if ($generate) { $sourceCount++ }
                 if ($ask) { $sourceCount++ }
@@ -3704,8 +4304,9 @@ else {
                 if ($passwordPath) { $sourceCount++ }
                 if ($passwordUrl) { $sourceCount++ }
                 if ($passwordSecretId) { $sourceCount++ }
+                if ($passwordSecret) { $sourceCount++ }
                 if ($sourceCount -ne 1) {
-                    throw "local_users '$userName': specify exactly one of 'password', 'password_path', 'password_url', 'password_secret_id', 'generate: true', or 'ask: true'."
+                    throw "local_users '$userName': specify exactly one of 'password', 'password_path', 'password_url', 'password_secret_id', 'password_secret', 'generate: true', or 'ask: true'."
                 }
 
                 # A password auto-generated by the script (either via generate: true, or
@@ -3747,7 +4348,7 @@ else {
                 }
                 else {
                     $plainPassword = Resolve-ConfigResource -InlineValue $inlinePassword -PathValue $passwordPath `
-                        -UrlValue $passwordUrl -SecretIdValue $passwordSecretId -Description "local_users '$userName' password"
+                        -UrlValue $passwordUrl -SecretIdValue $passwordSecretId -SecretValue $passwordSecret -Description "local_users '$userName' password"
                 }
 
                 $secure = ConvertTo-SecureString -String $plainPassword -AsPlainText -Force
@@ -3886,9 +4487,10 @@ else {
                 $passwordPath = Get-ConfigValue $entry @('password_path')
                 $passwordUrl = Get-ConfigValue $entry @('password_url')
                 $passwordSecretId = Get-ConfigValue $entry @('password_secret_id')
-                if ($inlinePassword -or $passwordPath -or $passwordUrl -or $passwordSecretId) {
+                $passwordSecret = Get-ConfigValue $entry @('password_secret')
+                if ($inlinePassword -or $passwordPath -or $passwordUrl -or $passwordSecretId -or $passwordSecret) {
                     $autologonPassword = Resolve-ConfigResource -InlineValue $inlinePassword -PathValue $passwordPath `
-                        -UrlValue $passwordUrl -SecretIdValue $passwordSecretId -Description "local_users '$userName' autologon password"
+                        -UrlValue $passwordUrl -SecretIdValue $passwordSecretId -SecretValue $passwordSecret -Description "local_users '$userName' autologon password"
                 }
             }
             if (-not $autologonPassword) {
@@ -3993,6 +4595,7 @@ else {
                 -PathValue (Get-ConfigValue $entry @('cert_path')) `
                 -UrlValue (Get-ConfigValue $entry @('cert_url')) `
                 -SecretIdValue (Get-ConfigValue $entry @('cert_secret_id')) `
+                -SecretValue (Get-ConfigValue $entry @('cert_secret')) `
                 -Description "root_ca '$certName'"
             $tempCertPath = Join-Path $env:TEMP "$certName.verify.pem"
             Set-Content -Path $tempCertPath -Value $certText -Encoding ascii
@@ -4008,6 +4611,7 @@ else {
                 -PathValue (Get-ConfigValue $entry @('cert_path')) `
                 -UrlValue (Get-ConfigValue $entry @('cert_url')) `
                 -SecretIdValue (Get-ConfigValue $entry @('cert_secret_id')) `
+                -SecretValue (Get-ConfigValue $entry @('cert_secret')) `
                 -Description "root_ca '$certName'"
 
             $tempCertPath = Join-Path $env:TEMP "$certName.pem"
@@ -4901,8 +5505,8 @@ function Invoke-SshdRestart {
 }
 
 Invoke-Step -Name 'Enable OpenSSH Server' -SkipReason $sshServerSkip -Tag 'ssh' -Verify {
-    $packageInstalled = Test-WingetPackageInstalled -Id 'Microsoft.OpenSSH.Preview'
     $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    $packageInstalled = ($null -ne $service) -or (Test-WingetPackageInstalled -Id 'Microsoft.OpenSSH.Preview')
     $serviceOk = $service -and $service.Status -eq 'Running' -and $service.StartType -eq 'Automatic'
     $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
     $ruleOk = $rule -and $rule.Enabled -eq 'True'
@@ -4914,7 +5518,8 @@ Invoke-Step -Name 'Enable OpenSSH Server' -SkipReason $sshServerSkip -Tag 'ssh' 
     # 10-20 minutes on a fresh VM. Microsoft.OpenSSH.Preview installs the same
     # upstream Win32-OpenSSH project via a local MSI in seconds instead -
     # "Preview" is just its release channel name, not an indicator it's unstable.
-    if (-not (Test-WingetPackageInstalled -Id 'Microsoft.OpenSSH.Preview')) {
+    # If sshd service is already present (e.g. pre-installed via MSI in Golden Image), skip winget.
+    if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue) -and -not (Test-WingetPackageInstalled -Id 'Microsoft.OpenSSH.Preview')) {
         & winget install -e --id Microsoft.OpenSSH.Preview --source winget `
             --accept-package-agreements --accept-source-agreements `
             --override 'ADDLOCAL=Server /qn /norestart'
@@ -5008,6 +5613,7 @@ foreach ($hostKey in $hostKeys) {
             -PathValue (Get-ConfigValue $hostKey @('private_key_path')) `
             -UrlValue (Get-ConfigValue $hostKey @('private_key_url')) `
             -SecretIdValue (Get-ConfigValue $hostKey @('private_key_secret_id')) `
+            -SecretValue (Get-ConfigValue $hostKey @('private_key_secret')) `
             -Description "ssh_server.host_keys ($keyType)"
         $keyPath = Join-Path (Join-Path $env:ProgramData 'ssh') "ssh_host_${keyType}_key"
         $normalizedContent = (($privateKeyContent -replace "`r`n", "`n").TrimEnd("`n")) + "`n"
@@ -5022,6 +5628,7 @@ foreach ($hostKey in $hostKeys) {
             -PathValue (Get-ConfigValue $hostKey @('private_key_path')) `
             -UrlValue (Get-ConfigValue $hostKey @('private_key_url')) `
             -SecretIdValue (Get-ConfigValue $hostKey @('private_key_secret_id')) `
+            -SecretValue (Get-ConfigValue $hostKey @('private_key_secret')) `
             -Description "ssh_server.host_keys ($keyType)"
 
         $sshDir = Join-Path $env:ProgramData 'ssh'
@@ -5939,14 +6546,15 @@ Invoke-Step -Name 'Configure kernel debugger transport' -SkipReason $kernelDebug
         $keyPath = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_path')
         $keyUrl = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_url')
         $keySecretId = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_secret_id')
+        $keySecret = Get-ConfigValue $Config @('kernel_debugging', 'network', 'key_secret')
         $generate = Get-ConfigValue $Config @('kernel_debugging', 'network', 'generate') $false
         $busParams = Get-ConfigValue $Config @('kernel_debugging', 'network', 'bus_params')
         if (-not $hostIp -or -not $port) {
             throw "kernel_debugging.network requires 'host_ip' and 'port'."
         }
-        $keySourceCount = @($inlineKey, $keyPath, $keyUrl, $keySecretId | Where-Object { $_ }).Count + [int]$generate
+        $keySourceCount = @($inlineKey, $keyPath, $keyUrl, $keySecretId, $keySecret | Where-Object { $_ }).Count + [int]$generate
         if ($keySourceCount -ne 1) {
-            throw "kernel_debugging.network: specify exactly one of 'key', 'key_path', 'key_url', 'key_secret_id', or 'generate: true'."
+            throw "kernel_debugging.network: specify exactly one of 'key', 'key_path', 'key_url', 'key_secret_id', 'key_secret', or 'generate: true'."
         }
 
         $current = (& bcdedit.exe /dbgsettings) -join "`n"
@@ -5969,7 +6577,7 @@ Invoke-Step -Name 'Configure kernel debugger transport' -SkipReason $kernelDebug
             }
             else {
             $resolvedKey = Resolve-ConfigResource -InlineValue $inlineKey -PathValue $keyPath -UrlValue $keyUrl `
-                -SecretIdValue $keySecretId -Description 'kernel_debugging.network.key'
+                -SecretIdValue $keySecretId -SecretValue $keySecret -Description 'kernel_debugging.network.key'
             & bcdedit.exe /dbgsettings NET "HOSTIP:$hostIp" "PORT:$port" "KEY:$resolvedKey" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "bcdedit /dbgsettings NET failed (exit $LASTEXITCODE)" }
             }
@@ -6029,9 +6637,10 @@ $winKeyInline = Get-ConfigValue $Config @('windows_product_key')
 $winKeyPath = Get-ConfigValue $Config @('windows_product_key_path')
 $winKeyUrl = Get-ConfigValue $Config @('windows_product_key_url')
 $winKeySecretId = Get-ConfigValue $Config @('windows_product_key_secret_id')
+$winKeySecret = Get-ConfigValue $Config @('windows_product_key_secret')
 $winKeySkip = if ($script:PendingComputerRename) {
     'a computer rename is pending a reboot - re-run after rebooting'
-} elseif (-not ($winKeyInline -or $winKeyPath -or $winKeyUrl -or $winKeySecretId)) {
+} elseif (-not ($winKeyInline -or $winKeyPath -or $winKeyUrl -or $winKeySecretId -or $winKeySecret)) {
     "no 'windows_product_key' configured"
 } else { $null }
 
@@ -6040,7 +6649,7 @@ $winKeySkip = if ($script:PendingComputerRename) {
 $windowsAppId = '55c92734-d682-4d71-983e-d6ec3f16059f'
 
 Invoke-Step -Name 'Install and activate Windows product key' -SkipReason $winKeySkip -Tag 'product_key' -Verify {
-    $desiredKey = (Resolve-ConfigResource -InlineValue $winKeyInline -PathValue $winKeyPath -UrlValue $winKeyUrl -SecretIdValue $winKeySecretId -Description 'windows_product_key').Trim()
+    $desiredKey = (Resolve-ConfigResource -InlineValue $winKeyInline -PathValue $winKeyPath -UrlValue $winKeyUrl -SecretIdValue $winKeySecretId -SecretValue $winKeySecret -Description 'windows_product_key').Trim()
     $desiredSuffix = $desiredKey.Substring($desiredKey.Length - 5)
 
     $product = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationID = '$windowsAppId' AND PartialProductKey IS NOT NULL" -ErrorAction SilentlyContinue
@@ -6058,7 +6667,7 @@ Invoke-Step -Name 'Install and activate Windows product key' -SkipReason $winKey
         [pscustomobject]@{ Ok = $true; Detail = "already activated with key ending '...$desiredSuffix'" }
     }
 } -Action {
-    $desiredKey = (Resolve-ConfigResource -InlineValue $winKeyInline -PathValue $winKeyPath -UrlValue $winKeyUrl -SecretIdValue $winKeySecretId -Description 'windows_product_key').Trim()
+    $desiredKey = (Resolve-ConfigResource -InlineValue $winKeyInline -PathValue $winKeyPath -UrlValue $winKeyUrl -SecretIdValue $winKeySecretId -SecretValue $winKeySecret -Description 'windows_product_key').Trim()
     $desiredSuffix = $desiredKey.Substring($desiredKey.Length - 5)
 
     $product = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationID = '$windowsAppId' AND PartialProductKey IS NOT NULL" -ErrorAction SilentlyContinue
@@ -6904,6 +7513,7 @@ else {
             $rebootNow = Confirm-RiskyAction -Message 'One or more changes above need a reboot to fully take effect. Reboot now? This will end this session if connected remotely (e.g. SSH/RDP).'
             if ($rebootNow) {
                 Write-Host 'Rebooting now...' -ForegroundColor Yellow
+                Close-BwSessionIfOwned
                 Stop-BootstrapTranscript
                 Restart-Computer -Force
             } else {
@@ -6920,6 +7530,7 @@ else {
     }
 }
 
+Close-BwSessionIfOwned
 Stop-BootstrapTranscript
 
 # Keep the process status meaningful to win-bootstrap.cmd, scheduled callers,
